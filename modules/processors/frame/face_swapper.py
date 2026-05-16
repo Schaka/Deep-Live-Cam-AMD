@@ -91,8 +91,7 @@ def get_face_swapper() -> Any:
             # older GPUs (e.g. GTX 16xx) where FP16 can produce NaN.
             fp32_path = os.path.join(models_dir, "inswapper_128.onnx")
             fp16_path = os.path.join(models_dir, "inswapper_128_fp16.onnx")
-            use_fp16 = _HAS_TORCH_CUDA and os.path.exists(fp16_path)
-            if use_fp16:
+            if os.path.exists(fp16_path):
                 model_path = fp16_path
             elif os.path.exists(fp32_path):
                 model_path = fp32_path
@@ -126,11 +125,23 @@ def get_face_swapper() -> Any:
                         # Use bare provider — ONNX Runtime defaults are
                         # fastest on modern GPUs (Blackwell/sm_120).
                         providers_config.append(p)
+                    elif p == "MIGraphXExecutionProvider":
+                        _cache_dir = os.path.expanduser("~/.cache/migraphx_models")
+                        os.makedirs(_cache_dir, exist_ok=True)
+                        providers_config.append((
+                            "MIGraphXExecutionProvider",
+                            {
+                                "migraphx_fp16_enable": "1",
+                                "migraphx_model_cache_dir": _cache_dir,
+                            },
+                        ))
                     else:
                         providers_config.append(p)
+                from modules.processors.frame._onnx_enhancer import make_session_options
                 FACE_SWAPPER = insightface.model_zoo.get_model(
                     model_path,
                     providers=providers_config,
+                    sess_options=make_session_options(providers_config),
                 )
                 # Set up CUDA graph session for faster inference
                 if _HAS_TORCH_CUDA and any(
@@ -350,6 +361,44 @@ def _fast_paste_back(target_img: Frame, bgr_fake: np.ndarray, aimg: np.ndarray, 
     return target_img
 
 
+def _face_mask_paste_back(target_img: Frame, bgr_fake: np.ndarray, M: np.ndarray, face_mask: np.ndarray) -> Frame:
+    """Paste bgr_fake back using a face-shaped feathered mask.
+
+    Uses landmark_2d_106 convex-hull mask instead of the rectangular affine
+    boundary.  The blend edge sits at the natural face/background boundary
+    so it is perceptually invisible even when the face is moving.
+    """
+    h, w = target_img.shape[:2]
+    IM = cv2.invertAffineTransform(M)
+
+    # Tighten work to the mask's bounding box.
+    ys, xs = np.where(face_mask > 0)
+    if len(xs) == 0:
+        return target_img
+
+    pad = 4
+    y1 = max(0, int(ys.min()) - pad)
+    y2 = min(h, int(ys.max()) + pad + 1)
+    x1 = max(0, int(xs.min()) - pad)
+    x2 = min(w, int(xs.max()) + pad + 1)
+    if x1 >= x2 or y1 >= y2:
+        return target_img
+
+    IM_crop = IM.copy()
+    IM_crop[0, 2] -= x1
+    IM_crop[1, 2] -= y1
+    crop_w, crop_h = x2 - x1, y2 - y1
+
+    bgr_fake_crop = cv2.warpAffine(bgr_fake, IM_crop, (crop_w, crop_h), borderMode=cv2.BORDER_REPLICATE)
+    mask_crop = face_mask[y1:y2, x1:x2].astype(np.float32) * (1.0 / 255.0)
+
+    target_crop = target_img[y1:y2, x1:x2]
+    mask_3c = mask_crop[:, :, np.newaxis]
+    blended = mask_3c * bgr_fake_crop.astype(np.float32) + (1.0 - mask_3c) * target_crop.astype(np.float32)
+    target_img[y1:y2, x1:x2] = np.clip(blended, 0, 255).astype(np.uint8)
+    return target_img
+
+
 def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     """Optimized face swapping with better memory management and performance."""
     face_swapper = get_face_swapper()
@@ -381,8 +430,8 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
         if not temp_frame.flags['C_CONTIGUOUS']:
             temp_frame = np.ascontiguousarray(temp_frame)
 
-        # Use paste_back=False and our optimized paste-back
-        if any("DmlExecutionProvider" in p for p in modules.globals.execution_providers):
+        is_dml = any("DmlExecutionProvider" in p for p in modules.globals.execution_providers)
+        if is_dml:
             with modules.globals.dml_lock:
                 bgr_fake, M = face_swapper.get(
                     temp_frame, target_face, source_face, paste_back=False
@@ -392,18 +441,22 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
                 temp_frame, target_face, source_face, paste_back=False
             )
 
-        if bgr_fake is None:
+        if bgr_fake is None or not isinstance(bgr_fake, np.ndarray):
             return original_frame
 
-        if not isinstance(bgr_fake, np.ndarray):
-            return original_frame
-
-        # Pass a dummy aimg with correct shape — _fast_paste_back only uses aimg.shape
-        # to create the white mask. Avoids redundant norm_crop2 (~0.6ms).
-        _face_size = face_swapper.input_size[0]
-        _aimg_dummy = np.empty((_face_size, _face_size, 3), dtype=np.uint8)
-
-        swapped_frame = _fast_paste_back(temp_frame, bgr_fake, _aimg_dummy, M)
+        lm = getattr(target_face, 'landmark_2d_106', None)
+        if lm is not None and isinstance(lm, np.ndarray) and lm.shape[0] >= 106 and np.all(np.isfinite(lm)):
+            face_mask = create_face_mask(target_face, temp_frame)
+            if face_mask is not None and face_mask.any():
+                swapped_frame = _face_mask_paste_back(temp_frame, bgr_fake, M, face_mask)
+            else:
+                _face_size = face_swapper.input_size[0]
+                _aimg_dummy = np.empty((_face_size, _face_size, 3), dtype=np.uint8)
+                swapped_frame = _fast_paste_back(temp_frame, bgr_fake, _aimg_dummy, M)
+        else:
+            _face_size = face_swapper.input_size[0]
+            _aimg_dummy = np.empty((_face_size, _face_size, 3), dtype=np.uint8)
+            swapped_frame = _fast_paste_back(temp_frame, bgr_fake, _aimg_dummy, M)
 
     except Exception as e:
         print(f"Error during face swap: {e}")

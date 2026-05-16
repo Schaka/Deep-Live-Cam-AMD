@@ -8,6 +8,9 @@ __pycache__/
 *.backup
 tf_env/
 *.png
+*.jpg
+*.jpeg
+*.webp
 *.mp4
 *.mkv
 
@@ -29,3 +32,5 @@ switch_states.json
 install.bat
 /.claude
 *.bat
+migraphx
+livecam_test_*

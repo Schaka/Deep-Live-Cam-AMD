@@ -29,12 +29,13 @@ def get_face_analyser() -> Any:
             if FACE_ANALYSER is None:
                 from modules.processors.frame._onnx_enhancer import (
                     build_provider_config,
+                    make_session_options,
                 )
                 providers = build_provider_config()
                 FACE_ANALYSER = insightface.app.FaceAnalysis(
                     name='buffalo_l',
                     providers=providers,
-                    allowed_modules=['detection', 'recognition', 'landmark_2d_106']
+                    sess_options=make_session_options(providers),
                 )
                 FACE_ANALYSER.prepare(ctx_id=0, det_size=DET_SIZE)
                 _optimize_det_model(FACE_ANALYSER, providers)
@@ -106,36 +107,12 @@ def _is_dml() -> bool:
 
 
 def _analyse_faces(frame: Frame) -> list:
-    """Run face detection, then recognition (and optionally landmark).
+    """Run face detection and all models via fa.get() — matches old code behavior.
 
-    Replaces InsightFace's ``FaceAnalysis.get()`` to skip the
-    landmark_2d_106 model when only face_swapper is active (saves ~1ms
-    per face and avoids an unnecessary ONNX session call).
+    The custom model-selection path skips 1k3d68/genderage which breaks
+    recognition on MIGraphX (GPU state not warmed up before rec model runs).
     """
-    fa = get_face_analyser()
-
-    bboxes, kpss = fa.det_model.detect(frame, max_num=0, metric="default")
-    if bboxes.shape[0] == 0:
-        return []
-
-    need_landmark = _needs_landmark()
-    rec_model = fa.models.get("recognition")
-    lmk_model = fa.models.get("landmark_2d_106") if need_landmark else None
-
-    from insightface.app.common import Face
-
-    faces = []
-    for i in range(bboxes.shape[0]):
-        face = Face(bbox=bboxes[i, 0:4],
-                    kps=kpss[i] if kpss is not None else None,
-                    det_score=bboxes[i, 4])
-        if rec_model is not None:
-            rec_model.get(frame, face)
-        if lmk_model is not None:
-            lmk_model.get(frame, face)
-        faces.append(face)
-
-    return faces
+    return get_face_analyser().get(frame)
 
 
 def get_one_face(frame: Frame, faces: Any = None) -> Any:
@@ -174,6 +151,34 @@ def detect_one_face_fast(frame: Frame) -> Any:
         return None
     idx = int(bboxes[:, 0].argmin())
     return Face(bbox=bboxes[idx, :4], kps=kpss[idx], det_score=bboxes[idx, 4])
+
+
+def detect_one_face_with_landmarks(frame: Frame) -> Any:
+    """Detection + landmark_2d_106 only — no recognition or genderage.
+
+    Returns Face with bbox, kps, det_score, and landmark_2d_106.
+    The landmark attributes allow face-contour blending, which eliminates
+    the visible rectangular boundary from affine-crop paste-back.
+    """
+    from insightface.app.common import Face
+    fa = get_face_analyser()
+    if _is_dml():
+        with modules.globals.dml_lock:
+            bboxes, kpss = fa.det_model.detect(frame, max_num=0, metric='default')
+    else:
+        bboxes, kpss = fa.det_model.detect(frame, max_num=0, metric='default')
+    if bboxes.shape[0] == 0:
+        return None
+    idx = int(bboxes[:, 0].argmin())
+    face = Face(bbox=bboxes[idx, :4], kps=kpss[idx], det_score=bboxes[idx, 4])
+    lmk_model = fa.models.get('landmark_2d_106')
+    if lmk_model is not None:
+        if _is_dml():
+            with modules.globals.dml_lock:
+                lmk_model.get(frame, face)
+        else:
+            lmk_model.get(frame, face)
+    return face
 
 
 def detect_many_faces_fast(frame: Frame) -> Any:

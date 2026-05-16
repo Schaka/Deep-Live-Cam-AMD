@@ -21,6 +21,27 @@ IS_APPLE_SILICON = platform.system() == "Darwin" and platform.machine() == "arm6
 THREAD_SEMAPHORE = threading.Semaphore(min(max(1, (os.cpu_count() or 1)), 8))
 
 
+def _is_gpu_provider_active(providers=None) -> bool:
+    if providers is None:
+        providers = modules.globals.execution_providers
+    gpu_prefixes = ("CUDA", "MIGraphX", "ROCM", "Dml", "CoreML")
+    for p in providers:
+        name = p[0] if isinstance(p, tuple) else p
+        if any(name.startswith(pfx) for pfx in gpu_prefixes):
+            return True
+    return False
+
+
+def make_session_options(providers=None) -> onnxruntime.SessionOptions:
+    opts = onnxruntime.SessionOptions()
+    opts.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+    if _is_gpu_provider_active(providers):
+        n = max(1, modules.globals.execution_threads)
+        opts.inter_op_num_threads = n
+        opts.intra_op_num_threads = n
+    return opts
+
+
 def build_provider_config(providers=None):
     """Wrap raw provider name strings with optimised CUDA / CoreML options.
 
@@ -48,6 +69,16 @@ def build_provider_config(providers=None):
                     "ModelFormat": "MLProgram",
                     "MLComputeUnits": "ALL",
                     "AllowLowPrecisionAccumulationOnGPU": 1,
+                },
+            ))
+        elif p == "MIGraphXExecutionProvider":
+            _cache_dir = os.path.expanduser("~/.cache/migraphx_models")
+            os.makedirs(_cache_dir, exist_ok=True)
+            config.append((
+                "MIGraphXExecutionProvider",
+                {
+                    "migraphx_fp16_enable": "1",
+                    "migraphx_model_cache_dir": _cache_dir,
                 },
             ))
         else:
@@ -112,10 +143,16 @@ def create_onnx_session(model_path: str) -> onnxruntime.InferenceSession:
         model_path = optimize_for_coreml(model_path, input_shape=input_shape)
 
     providers = build_provider_config()
-    session_options = onnxruntime.SessionOptions()
-    session_options.graph_optimization_level = (
-        onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
-    )
+    # GPEN models are FP16 — add FP16 flag for MIGraphX here only.
+    # build_provider_config is also used by retinaface detection where
+    # FP16 causes NaN in NMS, so the flag lives here instead.
+    providers = [
+        (p[0], {**p[1], "migraphx_fp16_enable": "1"})
+        if isinstance(p, tuple) and p[0] == "MIGraphXExecutionProvider"
+        else p
+        for p in providers
+    ]
+    session_options = make_session_options(providers)
     session = onnxruntime.InferenceSession(
         model_path, sess_options=session_options, providers=providers,
     )

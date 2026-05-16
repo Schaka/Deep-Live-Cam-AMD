@@ -1,318 +1,261 @@
-<h1 align="center">Deep-Live-Cam 2.1.5</h1>
+# Deep-Live-Cam (AMD / MiGraphX Fork)
 
-<p align="center">
-  Real-time face swap and video deepfake with a single click and only a single image.
-</p>
+Real-time face swap and video deepfake with a single click and a single image.
 
-<p align="center">
-<a href="https://trendshift.io/repositories/11395" target="_blank"><img src="https://trendshift.io/api/badge/repositories/11395" alt="hacksider%2FDeep-Live-Cam | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
-</p>
+This is a fork of [hacksider/Deep-Live-Cam](https://github.com/hacksider/Deep-Live-Cam), focused exclusively on AMD GPUs with ROCm 7.0+ and the MiGraphX execution provider. The upstream repository has effectively stopped receiving open-source updates. The maintainers chose to take an AGPLv3-licensed project and move meaningful development behind a paid download wall. Whether or not that is strictly illegal under the license is a question for lawyers. That it is a significant breach of open-source community norms is not. This fork exists so AMD users have a working, maintained, and actually open alternative.
 
-<p align="center">
-  <img src="media/demo.gif" alt="Demo GIF" width="800">
-</p>
+---
 
-##  Disclaimer
+## Disclaimer
 
-This deepfake software is designed to be a productive tool for the AI-generated media industry. It can assist artists in animating custom characters, creating engaging content, and even using models for clothing design.
+This software is designed for legitimate creative use: animating custom characters, content creation, and similar AI-generated media applications. Built-in checks block inappropriate content (nudity, graphic material, etc.).
 
-We are aware of the potential for unethical applications and are committed to preventative measures. A built-in check prevents the program from processing inappropriate media (nudity, graphic content, sensitive material like war footage, etc.). We will continue to develop this project responsibly, adhering to the law and ethics. We may shut down the project or add watermarks if legally required.
+- Obtain consent before using a real person's face.
+- Label any output clearly as a deepfake when sharing.
+- We are not responsible for misuse. Users are responsible for legal and ethical compliance.
 
-- Ethical Use: Users are expected to use this software responsibly and legally. If using a real person's face, obtain their consent and clearly label any output as a deepfake when sharing online.
+---
 
-- Content Restrictions: The software includes built-in checks to prevent processing inappropriate media, such as nudity, graphic content, or sensitive material.
+## Why This Fork
 
-- Legal Compliance: We adhere to all relevant laws and ethical guidelines. If legally required, we may shut down the project or add watermarks to the output.
+- The original codebase provided no working AMD GPU path beyond basic CPU fallback.
+- ONNX Runtime dropped its ROCm execution provider in favor of MiGraphX. The upstream code was not updated to reflect this.
+- The upstream project now ships new features exclusively in a paid binary while keeping the public repository stagnant.
+- AMD users with modern GPUs (tested on RX 9070 XT) had no working real-time path.
 
-- User Responsibility: We are not responsible for end-user actions. Users must ensure their use of the software aligns with ethical standards and legal requirements.
+This fork targets ROCm 7.0+ with MiGraphX, using the `onnxruntime-migraphx` wheel from AMD's official repository. The goal is to push as much work as possible onto the GPU so the CPU stays free. All major inference models (face detection, face swapper, face enhancer) run on the GPU via MiGraphX with FP16 where supported.
 
-By using this software, you agree to these terms and commit to using it in a manner that respects the rights and dignity of others.
+---
 
-Users are expected to use this software responsibly and legally. If using a real person's face, obtain their consent and clearly label any output as a deepfake when sharing online. We are not responsible for end-user actions.
+## Provided As-Is
 
-## Exclusive v2.7 beta Quick Start - Pre-built (Windows/Mac Silicon/CPU)
+This fork is a personal project. It works on the hardware it was tested on (RX 9070 XT, ROCm 7.x) and is shared in case it helps other AMD users. It is not production software. Some code paths were added during experimentation and have not been fully cleaned up. Some may not be strictly necessary anymore depending on your hardware.
 
-  <a href="https://deeplivecam.net/index.php/quickstart"> <img src="media/Download.png" width="285" height="77" />
+**The minimum viable change to make the official upstream code work with MiGraphX** is just this block at the very top of `run.py`, before any other imports:
 
-##### This is the fastest build you can get if you have a discrete NVIDIA or AMD GPU, CPU or Mac Silicon, And you'll receive special priority support. 2.7 beta is the best you can have with 30+ extra features than the open source version.
- 
-###### These Pre-builts are perfect for non-technical users or those who don't have time to, or can't manually install all the requirements. Just a heads-up: this is an open-source project, so you can also install it manually. 
+```python
+import sys, os
 
-## TLDR; Live Deepfake in just 3 Clicks
-![easysteps](https://github.com/user-attachments/assets/af825228-852c-411b-b787-ffd9aac72fc6)
-1. Select a face
-2. Select which camera to use
-3. Press live!
+# Must be set before ANY import so OMP/BLAS/HIP runtimes read them at init time.
+_is_migraphx = any('migraphx' in a.lower() for a in sys.argv)
+if _is_migraphx:
+    # Read --execution-threads from argv before argparse runs.
+    _exec_threads = '1'  # matches suggest_execution_threads() default for MIGraphX
+    for _i, _arg in enumerate(sys.argv):
+        if _arg == '--execution-threads' and _i + 1 < len(sys.argv):
+            _exec_threads = sys.argv[_i + 1]
+            break
 
-## Features & Uses - Everything is in real-time
+    # CPU thread pools used by ORT CPU fallback, OpenBLAS, and OpenMP.
+    os.environ.setdefault('OMP_NUM_THREADS', _exec_threads)
+    os.environ.setdefault('MKL_NUM_THREADS', _exec_threads)
+    os.environ.setdefault('OPENBLAS_NUM_THREADS', _exec_threads)
+    os.environ.setdefault('GOTO_NUM_THREADS', _exec_threads)
+    # Force ROCm/HIP to use interrupt-based GPU completion signalling instead
+    # of busy-polling CPU threads -- the primary cause of 100% CPU on all cores.
+    os.environ.setdefault('HSA_ENABLE_INTERRUPT', '1')
+    # Reduce HIP hardware queues (default can be 8+ per device).
+    os.environ.setdefault('GPU_MAX_HW_QUEUES', '1')
+```
 
-### Mouth Mask
+That alone will get MiGraphX running with the upstream code. You will still see a rectangular boundary around the swapped face on high-contrast backgrounds (the original square paste-back behavior), but it is not always obvious depending on the scene.
 
-**Retain your original mouth for accurate movement using Mouth Mask**
+The additional changes in this fork (landmark-based face mask blending, sync mode, ORT session thread limits, etc.) were built on top of that foundation to address specific artifacts. Many of them may not be necessary if your GPU is fast enough to process frames at or above webcam framerate without the CPU being hammered by HIP busy-polling. The interrupt mode fix alone removes most of the timing jitter. Everything else is incremental improvement.
 
-<p align="center">
-  <img src="media/ludwig.gif" alt="resizable-gif">
-</p>
+Sync mode in particular was an attempt to address a mismatch between the rate at which the model produces swapped frames and the rate at which the webcam delivers new ones. On a GPU that keeps up with the webcam, the queue draining approach (async default) is sufficient and sync mode offers little benefit.
 
-### Face Mapping
+---
 
-**Use different faces on multiple subjects simultaneously**
+## Key Changes in This Fork
 
-<p align="center">
-  <img src="media/streamers.gif" alt="face_mapping_source">
-</p>
+### Face Mask Blending (no more rectangle artifacts)
 
-### Your Movie, Your Face
+The original code pasted the swapped face back onto the frame using a rectangular affine boundary derived from the 128x128 inswapper crop area. Against high-contrast backgrounds (walls, door frames, etc.) this produced a visible rectangular or quadrilateral edge around the swapped face.
 
-**Watch movies with any face in real-time**
+This fork replaces that approach with a convex-hull mask derived from the `landmark_2d_106` facial landmarks. The mask follows the actual face contour with a feathered blend edge, so the swap blends naturally into the background regardless of what is behind the face. The face analyser was updated to use a combined detection + landmark model (`detect_one_face_with_landmarks`) so landmarks are always available during the live loop.
 
-<p align="center">
-  <img src="media/movie.gif" alt="movie">
-</p>
+The old rectangular paste-back is kept as a fallback for cases where landmarks are unavailable.
 
-### Live Show
+### Sync Mode and Jitter Fixes
 
-**Run Live shows and performances**
+In async (default) mode, the capture queue can accumulate frames faster than the GPU processes them. The processing worker would consume a frame that was already 1-2 frames stale by display time. The face-shaped mask was drawn from accurate current landmarks, but the swap was placed using stale keypoints, causing visible misalignment during movement.
 
-<p align="center">
-  <img src="media/live_show.gif" alt="show">
-</p>
+Fixes applied:
 
-### Memes
+- **Queue draining in async mode:** after pulling a frame from the capture queue, any remaining queued frames are discarded and only the newest is processed. This bounds display lag to approximately one capture interval (~33ms at 30fps).
+- **Sync mode toggle:** a new "Sync mode" option in the UI disables queue draining and processes every frame in order. In sync mode, frames are always fresh and consecutive, so the face moves smoothly without needing stabilization. The stabilizer (dead-zone + convergence blend) is disabled in sync mode because it would cause the swap keypoints to lag behind the accurate landmark positions, creating the very misalignment it was meant to prevent.
+- **Stabilizer retained for async mode:** in async mode, the dead-zone stabilizer still runs to smooth out the jumps caused by stale frames.
 
-**Create Your Most Viral Meme Yet**
+### CPU Load Reduction (ROCm / HIP Interrupt Mode)
 
-<p align="center">
-  <img src="media/meme.gif" alt="show" width="450"> 
-  <br>
-  <sub>Created using Many Faces feature in Deep-Live-Cam</sub>
-</p>
+ROCm defaults to busy-polling CPU threads to detect GPU completion instead of using hardware interrupts. With all CPU cores saturated by HIP spin-polling, the worker threads were starved of CPU time, causing irregular frame timing that produced jitter even when queue draining and stabilization were correctly implemented.
 
-### Omegle
+Fixes applied when MiGraphX is detected:
 
-**Surprise people on Omegle**
+- `HSA_ENABLE_INTERRUPT=1`: switches ROCm from spin-polling to interrupt mode. This is the decisive fix. CPU usage drops from near 100% across all cores to near zero at idle.
+- `GPU_MAX_HW_QUEUES=1`: one HIP queue per device instead of the default 8+.
+- Thread count environment variables (`OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `GOTO_NUM_THREADS`) set to 1.
+- ONNX Runtime `SessionOptions` with `inter_op_num_threads=1` and `intra_op_num_threads=1` on all sessions.
+- `cv2.setNumThreads(1)` at the start of the processing worker when MiGraphX is active.
 
-<p align="center">
-  <video src="https://github.com/user-attachments/assets/2e9b9b82-fa04-4b70-9f56-b1f68e7672d0" width="450" controls></video>
-</p>
+The symptom (all cores at 100%, all appearing as separate `python3 run.py` processes in htop) is the classic HIP spin-poll signature on ROCm. Switching to interrupt mode resolves it completely.
 
-## Installation (Manual)
+### MiGraphX Provider Configuration
 
-**Please be aware that the installation requires technical skills and is not for beginners. Consider downloading the quickstart version.**
+- FP16 inference enabled via `migraphx_fp16_enable=1` in provider config.
+- Model cache at `~/.cache/migraphx_models/` to avoid MiGraphX recompilation on every startup.
+- The `inswapper_128_fp16.onnx` model is preferred over the FP32 variant.
 
-<details>
-<summary>Click to see the process</summary>
+For more detail on jitter root causes and solutions, see [jitter_handling.md](jitter_handling.md).
 
-### Installation
+---
 
-This is more likely to work on your computer but will be slower as it utilizes the CPU.
+## Models Required
 
-**1. Set up Your Platform**
+Place models in the `models/` directory.
 
--   Python (3.11 recommended)
--   pip
--   git
--   [ffmpeg](https://www.youtube.com/watch?v=OlNWCpFdVMA) - ```iex (irm ffmpeg.tc.ht)```
--   [Visual Studio 2022 Runtimes (Windows)](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
+| Model | Link |
+|---|---|
+| `inswapper_128_fp16.onnx` | [Download](https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/inswapper_128_fp16.onnx) |
+| `GFPGANv1.4.onnx` | [Download](https://huggingface.co/hacksider/deep-live-cam/resolve/main/GFPGANv1.4.onnx) |
 
-**2. Clone the Repository**
+The FP16 inswapper is required. The FP32 variant (`inswapper_128.onnx`) works as a fallback but is slower and not recommended.
+
+---
+
+## Installation (Linux / AMD GPU)
+
+This setup is tested on ROCm 7.0+ with MiGraphX. Python 3.12 is required throughout.
+
+### Recommended: Distrobox
+
+Using [distrobox](https://github.com/89luca89/distrobox) avoids polluting your host system and gives you a clean ROCm environment with all GPU libraries pre-installed.
+
+**1. Create the container**
+
+Use the official AMD ONNX Runtime image. Pick a tag matching your ROCm version:
+
+```
+rocm/onnxruntime:rocm7.2.3_ub24.04_ort1.23_torch2.10.0
+```
+
+Available tags: https://hub.docker.com/r/rocm/onnxruntime
 
 ```bash
-git clone https://github.com/hacksider/Deep-Live-Cam.git
+distrobox create --name dlc-amd --image rocm/onnxruntime:rocm7.2.3_ub24.04_ort1.23_torch2.10.0
+distrobox enter dlc-amd
+```
+
+**2. Install system dependencies**
+
+```bash
+sudo apt install git ffmpeg python3-tk
+```
+
+**3. Clone the repo**
+
+```bash
+git clone https://github.com/Schaka/Deep-Live-Cam.git
 cd Deep-Live-Cam
 ```
 
-**3. Download the Models**
+**4. Create a virtual environment**
 
-1. [GFPGANv1.4](https://huggingface.co/hacksider/deep-live-cam/resolve/main/GFPGANv1.4.onnx)
-2. [inswapper\_128\_fp16.onnx](https://huggingface.co/hacksider/deep-live-cam/resolve/main/inswapper_128_fp16.onnx)
-
-Place these files in the "**models**" folder.
-
-**4. Install Dependencies**
-
-We highly recommend using a `venv` to avoid issues.
-
-
-For Windows:
 ```bash
-python -m venv venv
-venv\Scripts\activate
-pip install -r requirements.txt
-```
-For Linux:
-```bash
-# Ensure you use the installed Python 3.11
 python3 -m venv venv
 source venv/bin/activate
+```
+
+**5. Install Python dependencies**
+
+Remove the generic onnxruntime packages and install requirements:
+
+```bash
+pip uninstall onnxruntime onnxruntime-gpu -y
 pip install -r requirements.txt
 ```
 
-**For macOS:**
+**6. Install the MiGraphX ONNX Runtime wheel**
 
-Apple Silicon (M1/M2/M3) requires specific setup:
+Grab the correct wheel from AMD's repository. The wheel must match your Python version (3.12) and ROCm version.
 
-```bash
-# Install Python 3.11 (specific version is important)
-brew install python@3.11
+Browse available wheels: https://repo.radeon.com/rocm/manylinux/
 
-# Install tkinter package (required for the GUI)
-brew install python-tk@3.11
-
-# Create and activate virtual environment with Python 3.11
-python3.11 -m venv venv
-source venv/bin/activate
-
-# Install dependencies
-pip install -r requirements.txt
-```
-
-** In case something goes wrong and you need to reinstall the virtual environment **
+Example for ROCm 7.2.3:
 
 ```bash
-# Deactivate the virtual environment
-rm -rf venv
-
-# Reinstall the virtual environment
-python -m venv venv
-source venv/bin/activate
-
-# install the dependencies again
-pip install -r requirements.txt
-
-# gfpgan and basicsrs issue fix
-pip install git+https://github.com/xinntao/BasicSR.git@master
-pip uninstall gfpgan -y
-pip install git+https://github.com/TencentARC/GFPGAN.git@master
+pip install https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.3/onnxruntime_migraphx-1.23.2-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
 ```
 
-**Run:** If you don't have a GPU, you can run Deep-Live-Cam using `python run.py`. Note that initial execution will download models (~300MB).
+Adjust the URL to match your ROCm version and the available wheel filename.
 
-### GPU Acceleration
-
-**CUDA Execution Provider (Nvidia)**
-
-1. Install [CUDA Toolkit 12.8.0](https://developer.nvidia.com/cuda-12-8-0-download-archive)
-2. Install [cuDNN v8.9.7 for CUDA 12.x](https://developer.nvidia.com/rdp/cudnn-archive) (required for onnxruntime-gpu):
-   - Download cuDNN v8.9.7 for CUDA 12.x
-   - Make sure the cuDNN bin directory is in your system PATH
-3. Install dependencies:
+**7. Verify GPU provider is available**
 
 ```bash
-pip install -U torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
-pip uninstall onnxruntime onnxruntime-gpu
-pip install onnxruntime-gpu==1.21.0
+python -c "import onnxruntime; print(onnxruntime.get_available_providers())"
 ```
 
-3. Usage:
+`MIGraphXExecutionProvider` must appear in the output.
+
+**8. Download models**
 
 ```bash
-python run.py --execution-provider cuda
+mkdir -p models
+wget -O models/inswapper_128_fp16.onnx \
+  https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/inswapper_128_fp16.onnx
+wget -O models/GFPGANv1.4.onnx \
+  https://huggingface.co/hacksider/deep-live-cam/resolve/main/GFPGANv1.4.onnx
 ```
 
-**CoreML Execution Provider (Apple Silicon)**
-
-Apple Silicon (M1/M2/M3) specific installation:
-
-1. Make sure you've completed the macOS setup above using Python 3.11.
-2. Install dependencies:
+**9. Run**
 
 ```bash
-pip uninstall onnxruntime onnxruntime-silicon
-pip install onnxruntime-silicon==1.13.1
+python3 run.py --execution-provider migraphx
 ```
 
-3. Usage:
+On first run, MiGraphX will compile the models and cache them in `~/.cache/migraphx_models/`. Subsequent starts are significantly faster.
 
-```bash
-python3.11 run.py --execution-provider coreml
-```
-
-**Important Notes for macOS:**
-- You **must** use Python 3.11, not newer versions like 3.13
-- Always run with `python3.11` command not just `python` if you have multiple Python versions installed
-- If you get error about `_tkinter` missing, reinstall the tkinter package: `brew reinstall python-tk@3.11`
-- If you get model loading errors, check that your models are in the correct folder
-- If you encounter conflicts with other Python versions, consider uninstalling them:
-  ```bash
-  # List all installed Python versions
-  brew list | grep python
-
-  # Uninstall conflicting versions if needed
-  brew uninstall --ignore-dependencies python@3.13
-
-  # Keep only Python 3.11
-  brew cleanup
-  ```
-
-**CoreML Execution Provider (Apple Legacy)**
-
-1. Install dependencies:
-
-```bash
-pip uninstall onnxruntime onnxruntime-coreml
-pip install onnxruntime-coreml==1.21.0
-```
-
-2. Usage:
-
-```bash
-python run.py --execution-provider coreml
-```
-
-**DirectML Execution Provider (Windows)**
-
-1. Install dependencies:
-
-```bash
-pip uninstall onnxruntime onnxruntime-directml
-pip install onnxruntime-directml==1.21.0
-```
-
-2. Usage:
-
-```bash
-python run.py --execution-provider directml
-```
-
-**OpenVINO™ Execution Provider (Intel)**
-
-1. Install dependencies:
-
-```bash
-pip uninstall onnxruntime onnxruntime-openvino
-pip install onnxruntime-openvino==1.21.0
-```
-
-2. Usage:
-
-```bash
-python run.py --execution-provider openvino
-```
-</details>
+---
 
 ## Usage
 
-**1. Image/Video Mode**
+**Webcam / Live Mode**
 
--   Execute `python run.py`.
--   Choose a source face image and a target image/video.
--   Click "Start".
--   The output will be saved in a directory named after the target video.
+1. Run `python3 run.py --execution-provider migraphx`
+2. Select a source face image
+3. Click "Live"
+4. Wait for the preview (first run takes longer due to MiGraphX model compilation)
+5. Use OBS or any screen capture tool to stream
 
-**2. Webcam Mode**
+**Image / Video Mode**
 
--   Execute `python run.py`.
--   Select a source face image.
--   Click "Live".
--   Wait for the preview to appear (10-30 seconds).
--   Use a screen capture tool like OBS to stream.
--   To change the face, select a new source image.
+1. Run `python3 run.py --execution-provider migraphx`
+2. Choose a source face image and a target image or video
+3. Click "Start"
+4. Output is saved in a directory named after the target file
 
-## Download all models in this huggingface link
-- [**Download models here**](https://huggingface.co/hacksider/deep-live-cam/tree/main)
+---
 
-## Command Line Arguments (Unmaintained)
+## UI Options (MiGraphX / AMD Specific)
+
+| Option | Description |
+|---|---|
+| Sync mode | Process every frame in order. Reduces jitter during fast movement at the cost of potential FPS reduction if the GPU cannot keep up with the webcam framerate. |
+| Show FPS | Display swap rate counter on the live preview. |
+
+---
+
+## Performance Notes
+
+- RX 9070 XT achieves approximately 30 face swaps per second with MiGraphX, matching a 30fps webcam.
+- The goal is zero meaningful CPU usage during inference. All detection, swapping, and enhancement runs on the GPU.
+- `HSA_ENABLE_INTERRUPT=1` is critical. Without it, ROCm busy-polls CPU cores and causes timing jitter that no amount of queue or stabilizer tuning can fix.
+- MiGraphX model cache at `~/.cache/migraphx_models/` is created automatically.
+- FP16 is enabled by default and does not cause quality issues.
+
+---
+
+## Command Line Arguments
 
 ```
 options:
@@ -329,59 +272,27 @@ options:
   --mouth-mask                                             mask the mouth region
   --video-encoder {libx264,libx265,libvpx-vp9}             adjust output video encoder
   --video-quality [0-51]                                   adjust output video quality
-  --live-mirror                                            the live camera display as you see it in the front-facing camera frame
-  --live-resizable                                         the live camera frame is resizable
+  --live-mirror                                            mirror the live camera display
+  --live-resizable                                         make the live camera frame resizable
   --max-memory MAX_MEMORY                                  maximum amount of RAM in GB
-  --execution-provider {cpu} [{cpu} ...]                   available execution provider (choices: cpu, ...)
+  --execution-provider {cpu,migraphx,cuda,...}             available execution provider
   --execution-threads EXECUTION_THREADS                    number of execution threads
   -v, --version                                            show program's version number and exit
 ```
 
-Looking for a CLI mode? Using the -s/--source argument will make the run program in cli mode.
+---
 
-## Press
+## Known Limitations
 
- - [**Ars Technica**](https://arstechnica.com/information-technology/2024/08/new-ai-tool-enables-real-time-face-swapping-on-webcams-raising-fraud-concerns/) - *"Deep-Live-Cam goes viral, allowing anyone to become a digital doppelganger"*
- - [**Yahoo!**](https://www.yahoo.com/tech/ok-viral-ai-live-stream-080041056.html) - *"OK, this viral AI live stream software is truly terrifying"*
- - [**CNN Brasil**](https://www.cnnbrasil.com.br/tecnologia/ia-consegue-clonar-rostos-na-webcam-entenda-funcionamento/) - *"AI can clone faces on webcam; understand how it works"*
- - [**Bloomberg Technoz**](https://www.bloombergtechnoz.com/detail-news/71032/kenalan-dengan-teknologi-deep-live-cam-bisa-jadi-alat-menipu) - *"Get to know Deep Live Cam technology, it can be used as a tool for deception."*
- - [**TrendMicro**](https://www.trendmicro.com/vinfo/gb/security/news/cyber-attacks/ai-vs-ai-deepfakes-and-ekyc) - *"AI vs AI: DeepFakes and eKYC"*
- - [**PetaPixel**](https://petapixel.com/2024/08/14/deep-live-cam-deepfake-ai-tool-lets-you-become-anyone-in-a-video-call-with-single-photo-mark-zuckerberg-jd-vance-elon-musk/) - *"Deepfake AI Tool Lets You Become Anyone in a Video Call With Single Photo"*
- - [**SomeOrdinaryGamers**](https://www.youtube.com/watch?time_continue=1074&v=py4Tc-Y8BcY) - *"That's Crazy, Oh God. That's Fucking Freaky Dude... That's So Wild Dude"*
- - [**IShowSpeed**](https://www.youtube.com/live/mFsCe7AIxq8?feature=shared&t=2686) - *"Alright look look look, now look chat, we can do any face we want to look like chat"*
- - [**TechLinked (Linus Tech Tips)**](https://www.youtube.com/watch?v=wnCghLjqv3s&t=551s) - *"They do a pretty good job matching poses, expression and even the lighting"*
- - [**IShowSpeed**](https://youtu.be/JbUPRmXRUtE?t=3964) - *"What the F***! Why do I look like Vinny Jr? I look exactly like Vinny Jr!? No, this shit is crazy! Bro This is F*** Crazy!"*
+- **Face enhancer:** the GFPGAN and GPEN enhancer options exist in the UI but are not well tested with MiGraphX. The original codebase provides no documentation on how these models are expected to behave under non-CUDA providers. They may produce incorrect results or fail silently. Disable them if the output looks wrong.
+- **Many faces / Map faces:** these modes are inherited from upstream and have not been specifically tested with the MiGraphX code paths in this fork.
+- This fork targets live webcam mode first. Image/video batch processing should work but is secondary.
 
+---
 
 ## Credits
 
--   [ffmpeg](https://ffmpeg.org/): for making video-related operations easy
--   [Henry](https://github.com/henryruhs): One of the major contributor in this repo
--   [deepinsight](https://github.com/deepinsight): for their [insightface](https://github.com/deepinsight/insightface) project which provided a well-made library and models. Please be reminded that the [use of the model is for non-commercial research purposes only](https://github.com/deepinsight/insightface?tab=readme-ov-file#license).
--   [havok2-htwo](https://github.com/havok2-htwo): for sharing the code for webcam
--   [GosuDRM](https://github.com/GosuDRM): for the open version of roop
--   [pereiraroland26](https://github.com/pereiraroland26): Multiple faces support
--   [vic4key](https://github.com/vic4key): For supporting/contributing to this project
--   [kier007](https://github.com/kier007): for improving the user experience
--   [qitianai](https://github.com/qitianai): for multi-lingual support
--   [laurigates](https://github.com/laurigates): Decoupling stuffs to make everything faster!
--   [maxwbuckley](https://github.com/maxwbuckley): For making the effort to optimize this for mac!
--   and [all developers](https://github.com/hacksider/Deep-Live-Cam/graphs/contributors) behind libraries used in this project.
--   Footnote: Please be informed that the base author of the code is [s0md3v](https://github.com/s0md3v/roop)
--   All the wonderful users who helped make this project go viral by starring the repo ❤️
-
-[![Stargazers](https://reporoster.com/stars/hacksider/Deep-Live-Cam)](https://github.com/hacksider/Deep-Live-Cam/stargazers)
-
-## Contributions
-
-![Alt](https://repobeats.axiom.co/api/embed/fec8e29c45dfdb9c5916f3a7830e1249308d20e1.svg "Repobeats analytics image")
-
-## Stars to the Moon 🚀
-
-<a href="https://star-history.com/#hacksider/deep-live-cam&Date">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=hacksider/deep-live-cam&type=Date&theme=dark" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=hacksider/deep-live-cam&type=Date" />
-   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=hacksider/deep-live-cam&type=Date" />
- </picture>
-</a>
+- [hacksider/Deep-Live-Cam](https://github.com/hacksider/Deep-Live-Cam): original project this fork is based on
+- [s0md3v/roop](https://github.com/s0md3v/roop): base codebase
+- [ffmpeg](https://ffmpeg.org/): video operations
+- [deepinsight/insightface](https://github.com/deepinsight/insightface): face detection and swapper models (non-commercial research use only per their license)

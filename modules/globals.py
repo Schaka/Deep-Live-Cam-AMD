@@ -38,6 +38,7 @@ video_quality: int | None = None # Typically a CRF value or bitrate
 # Live Mode Options
 live_mirror: bool = False
 live_resizable: bool = True
+live_sync: bool = True              # Synchronous processing — no frame skip, lower lag at cost of fps
 camera_input_combobox: Any | None = None # Placeholder for UI element if needed
 webcam_preview_running: bool = False
 show_fps: bool = False

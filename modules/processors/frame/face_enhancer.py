@@ -47,7 +47,8 @@ def pre_check() -> bool:
     if not os.path.exists(model_path):
         update_status(
             f"GFPGAN ONNX model not found at {model_path}. "
-            "Please place gfpgan-1024.onnx in the models folder.",
+            "Convert GFPGANv1.4.pth by running: python convert_gfpgan_to_onnx.py "
+            "(requires: pip install torch gfpgan basicsr facexlib)",
             NAME,
         )
         return False
@@ -61,6 +62,74 @@ def pre_start() -> bool:
         update_status("Select an image or video for target path.", NAME)
         return False
     return True
+
+
+def _create_gfpgan_session(model_path: str) -> onnxruntime.InferenceSession:
+    """Try providers in priority order for GFPGAN.
+
+    MiGraphX with fp16 enabled causes std::bad_alloc in simplify_reshapes
+    on GFPGAN's StyleGAN2 reshape graph. Try without fp16 first, then
+    ROCMExecutionProvider, raising only if all GPU options are exhausted.
+    """
+    from modules.processors.frame._onnx_enhancer import make_session_options
+    session_options = make_session_options()
+
+    available = onnxruntime.get_available_providers()
+
+    # Attempt 1: MiGraphX without fp16 (fp16 conversion inflates reshape graph)
+    if "MIGraphXExecutionProvider" in available:
+        _cache_dir = os.path.expanduser("~/.cache/migraphx_models")
+        os.makedirs(_cache_dir, exist_ok=True)
+        try:
+            sess = onnxruntime.InferenceSession(
+                model_path,
+                sess_options=session_options,
+                providers=[
+                    ("MIGraphXExecutionProvider", {
+                        "migraphx_fp16_enable": "0",
+                        "migraphx_model_cache_dir": _cache_dir,
+                    }),
+                    "CPUExecutionProvider",
+                ],
+            )
+            print(f"{NAME}: Loaded with MiGraphX (fp32).")
+            return sess
+        except Exception as e:
+            print(f"{NAME}: MiGraphX fp32 failed: {e}")
+
+    # Attempt 2: ROCm EP (HIP kernels, no MiGraphX compiler pass)
+    if "ROCMExecutionProvider" in available:
+        try:
+            sess = onnxruntime.InferenceSession(
+                model_path,
+                sess_options=session_options,
+                providers=["ROCMExecutionProvider", "CPUExecutionProvider"],
+            )
+            print(f"{NAME}: Loaded with ROCMExecutionProvider.")
+            return sess
+        except Exception as e:
+            print(f"{NAME}: ROCMExecutionProvider failed: {e}")
+
+    # Attempt 3: any non-MiGraphX GPU provider from globals
+    from modules.processors.frame._onnx_enhancer import build_provider_config
+    non_migraphx = [
+        p for p in build_provider_config()
+        if not (isinstance(p, tuple) and p[0] == "MIGraphXExecutionProvider")
+        and p != "MIGraphXExecutionProvider"
+    ]
+    if non_migraphx:
+        try:
+            sess = onnxruntime.InferenceSession(
+                model_path,
+                sess_options=session_options,
+                providers=non_migraphx + ["CPUExecutionProvider"],
+            )
+            print(f"{NAME}: Loaded with fallback providers: {non_migraphx}")
+            return sess
+        except Exception as e:
+            print(f"{NAME}: Fallback providers failed: {e}")
+
+    raise RuntimeError("No GPU provider could load GFPGAN. Check MiGraphX/ROCm setup.")
 
 
 def get_face_enhancer() -> onnxruntime.InferenceSession:
@@ -80,11 +149,11 @@ def get_face_enhancer() -> onnxruntime.InferenceSession:
                 )
 
             try:
-                from modules.processors.frame._onnx_enhancer import (
-                    create_onnx_session,
-                )
-
-                FACE_ENHANCER = create_onnx_session(model_path)
+                try:
+                    FACE_ENHANCER = _create_gfpgan_session(model_path)
+                except Exception as gpu_err:
+                    print(f"{NAME}: All GPU providers failed: {gpu_err}")
+                    raise
 
                 input_info = FACE_ENHANCER.get_inputs()[0]
                 output_info = FACE_ENHANCER.get_outputs()[0]

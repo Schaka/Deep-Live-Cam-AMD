@@ -2,9 +2,17 @@ import os
 import sys
 # single thread doubles cuda performance - needs to be set before torch import
 if any(arg.startswith('--execution-provider') for arg in sys.argv):
-    os.environ['OMP_NUM_THREADS'] = '6'
+    _is_migraphx = any('migraphx' in arg.lower() for arg in sys.argv)
+    _omp_threads = '1' if _is_migraphx else '6'
+    os.environ['OMP_NUM_THREADS'] = _omp_threads
+    os.environ['MKL_NUM_THREADS'] = _omp_threads
+    os.environ['OPENBLAS_NUM_THREADS'] = _omp_threads
 # reduce tensorflow log level
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+# persist MIGraphX kernel tuning decisions across runs
+_migraphx_cache_dir = os.path.expanduser('~/.cache/migraphx_models')
+os.makedirs(_migraphx_cache_dir, exist_ok=True)
+os.environ['MIGRAPHX_PROBLEM_CACHE'] = os.path.join(_migraphx_cache_dir, 'problem_cache.json')
 import warnings
 from typing import List
 import platform
@@ -154,6 +162,8 @@ def suggest_execution_threads() -> int:
     if 'DmlExecutionProvider' in modules.globals.execution_providers:
         return 1
     if 'ROCMExecutionProvider' in modules.globals.execution_providers:
+        return 1
+    if any('MIGraphX' in (p if isinstance(p, str) else p[0]) for p in modules.globals.execution_providers):
         return 1
     if 'CUDAExecutionProvider' in modules.globals.execution_providers:
         return 2

@@ -3,6 +3,27 @@
 import os
 import sys
 
+# Must be set before ANY import so OMP/BLAS/HIP runtimes read them at init time.
+_is_migraphx = any('migraphx' in a.lower() for a in sys.argv)
+if _is_migraphx:
+    # Read --execution-threads from argv before argparse runs.
+    _exec_threads = '1'  # matches suggest_execution_threads() default for MIGraphX
+    for _i, _arg in enumerate(sys.argv):
+        if _arg == '--execution-threads' and _i + 1 < len(sys.argv):
+            _exec_threads = sys.argv[_i + 1]
+            break
+
+    # CPU thread pools used by ORT CPU fallback, OpenBLAS, and OpenMP.
+    os.environ.setdefault('OMP_NUM_THREADS', _exec_threads)
+    os.environ.setdefault('MKL_NUM_THREADS', _exec_threads)
+    os.environ.setdefault('OPENBLAS_NUM_THREADS', _exec_threads)
+    os.environ.setdefault('GOTO_NUM_THREADS', _exec_threads)
+    # Force ROCm/HIP to use interrupt-based GPU completion signalling instead
+    # of busy-polling CPU threads — the primary cause of 100% CPU on all cores.
+    os.environ.setdefault('HSA_ENABLE_INTERRUPT', '1')
+    # Reduce HIP hardware queues (default can be 8+ per device).
+    os.environ.setdefault('GPU_MAX_HW_QUEUES', '1')
+
 # Add the project root to PATH so bundled ffmpeg/ffprobe are found
 project_root = os.path.dirname(os.path.abspath(__file__))
 os.environ["PATH"] = project_root + os.pathsep + os.environ.get("PATH", "")

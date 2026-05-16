@@ -58,6 +58,7 @@ from modules.face_analyser import (
     add_blank_map,
     detect_many_faces_fast,
     detect_one_face_fast,
+    detect_one_face_with_landmarks,
     get_one_face,
     get_unique_faces_from_target_image,
     get_unique_faces_from_target_video,
@@ -89,6 +90,13 @@ PREVIEW_MAX_HEIGHT = 700
 PREVIEW_MAX_WIDTH = 1200
 PREVIEW_DEFAULT_WIDTH = 640
 PREVIEW_DEFAULT_HEIGHT = 360
+
+PREVIEW_SIZE_PRESETS = [
+    ("640 × 360", 640, 360),
+    ("854 × 480", 854, 480),
+    ("1280 × 720", 1280, 720),
+    ("1920 × 1080", 1920, 1080),
+]
 
 POPUP_WIDTH = 750
 POPUP_HEIGHT = 810
@@ -307,6 +315,7 @@ def save_switch_states():
         "nsfw_filter": modules.globals.nsfw_filter,
         "live_mirror": modules.globals.live_mirror,
         "live_resizable": modules.globals.live_resizable,
+        "live_sync": modules.globals.live_sync,
         "fp_ui": modules.globals.fp_ui,
         "show_fps": modules.globals.show_fps,
         "mouth_mask": modules.globals.mouth_mask,
@@ -334,6 +343,7 @@ def load_switch_states():
         modules.globals.nsfw_filter = state.get("nsfw_filter", False)
         modules.globals.live_mirror = state.get("live_mirror", False)
         modules.globals.live_resizable = state.get("live_resizable", False)
+        modules.globals.live_sync = state.get("live_sync", True)
         modules.globals.fp_ui = state.get("fp_ui", {"face_enhancer": False})
         modules.globals.show_fps = state.get("show_fps", False)
         modules.globals.mouth_mask_size = state.get("mouth_mask_size", 0.0)
@@ -710,6 +720,25 @@ class MainWindow(QMainWindow):
         self.cb_camera.setToolTip(_("Select which camera to use for live mode"))
         layout.addWidget(self.cb_camera, 1)
 
+        self.cb_preview_size = QComboBox()
+        for label, w, h in PREVIEW_SIZE_PRESETS:
+            self.cb_preview_size.addItem(label, (w, h))
+        self.cb_preview_size.setToolTip(_("Preview window size"))
+        layout.addWidget(self.cb_preview_size)
+
+        self.sw_live_sync = _Switch(
+            _("Sync mode"),
+            modules.globals.live_sync,
+            _("Process every frame in order (less jitter on fast movement, may lower FPS)"),
+        )
+        self.sw_live_sync.toggled.connect(
+            lambda v: (
+                setattr(modules.globals, "live_sync", v),
+                save_switch_states(),
+            )
+        )
+        layout.addWidget(self.sw_live_sync)
+
         self.btn_live = QPushButton(_("Live"))
         self.btn_live.setEnabled(cam_ok)
         self.btn_live.setToolTip(_("Start real-time face swap using webcam"))
@@ -913,6 +942,7 @@ class MainWindow(QMainWindow):
             update_status("No camera available")
             return
         camera_index = self._camera_indices[idx]
+        pw, ph = self.cb_preview_size.currentData()
         if _LIVE_MAPPER is not None and _LIVE_MAPPER.isVisible():
             update_status("Source x Target Mapper is already open.")
             _LIVE_MAPPER.raise_()
@@ -925,10 +955,10 @@ class MainWindow(QMainWindow):
             from modules.processors.frame.face_swapper import get_face_swapper
             get_face_analyser()
             get_face_swapper()
-            _open_webcam_preview(camera_index)
+            _open_webcam_preview(camera_index, pw, ph)
         else:
             modules.globals.source_target_map = []
-            _open_live_mapper_dialog(camera_index, modules.globals.source_target_map)
+            _open_live_mapper_dialog(camera_index, modules.globals.source_target_map, pw, ph)
 
     def closeEvent(self, event):
         # Treat OS-level close as Destroy click
@@ -1040,9 +1070,98 @@ class _ProcessingWorker(QThread):
         self._fps = camera_fps
 
     def run(self) -> None:
+        _is_migraphx = any(
+            "MIGraphX" in (p if isinstance(p, str) else p[0])
+            for p in modules.globals.execution_providers
+        )
+        if _is_migraphx:
+            cv2.setNumThreads(max(1, modules.globals.execution_threads))
+
         frame_processors = get_frame_processors_modules(modules.globals.frame_processors)
+
+        # Load swapper first so MIGraphX compiles (or loads .mxr cache) while
+        # VRAM is uncontested. Keep reference for warmup inference below.
+        swapper_module = None
+        for fp in frame_processors:
+            if fp.NAME == "DLC.FACE-SWAPPER":
+                swapper_module = fp
+                fp.get_face_swapper()
+                break
+
+        _is_migraphx = any(
+            "MIGraphX" in (p if isinstance(p, str) else p[0])
+            for p in modules.globals.execution_providers
+        )
+
+        # Load source face.
+        # On MIGraphX, recognition model produces garbage (not necessarily NaN)
+        # for the first N inferences — N is unknown. A normalized embedding is
+        # always unit-norm so norm checks can't detect garbage. Instead check
+        # STABILITY: run until two consecutive calls on the same image return
+        # near-identical embeddings (cos_sim > 0.95). Stable = model warmed up.
         source_image = None
         last_source_path = None
+        _swapper_obj = swapper_module.get_face_swapper() if swapper_module else None
+        if modules.globals.source_path and os.path.exists(modules.globals.source_path):
+            _src = cv2.imread(modules.globals.source_path)
+            if _src is not None:
+                _prev_emb = None
+                _last_face = None
+                for _attempt in range(12):
+                    _face = get_one_face(_src)
+                    _emb = getattr(_face, "normed_embedding", None) if _face else None
+                    if _emb is not None and np.all(np.isfinite(_emb)):
+                        if _prev_emb is not None:
+                            _cos = float(np.dot(_emb.flatten(), _prev_emb.flatten()))
+                            if _is_migraphx:
+                                print(
+                                    f"[DLC.FACE-SWAPPER] embedding attempt"
+                                    f" {_attempt + 1}: cos_sim={_cos:.4f}"
+                                )
+                            if _cos > 0.95:
+                                source_image = _face
+                                break
+                        _prev_emb = _emb.copy()
+                        _last_face = _face
+                    else:
+                        _prev_emb = None
+                        if _is_migraphx:
+                            print(
+                                f"[DLC.FACE-SWAPPER] embedding attempt"
+                                f" {_attempt + 1}: NaN/None, retrying"
+                            )
+                if source_image is None and _last_face is not None:
+                    source_image = _last_face  # best effort fallback
+                last_source_path = modules.globals.source_path
+
+        # Prime det + inswapper with real webcam frames (identical path to
+        # live loop). Skip frames where kps are non-finite to avoid the
+        # transform.py:84 divide-by-zero during the first det call.
+        if _is_migraphx and _swapper_obj is not None and source_image is not None:
+            _warmed = 0
+            _t0 = time.time()
+            while _warmed < 5 and time.time() - _t0 < 2.0:
+                try:
+                    _wf = self._cq.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                if modules.globals.live_mirror:
+                    _wf = gpu_flip(_wf, 1)
+                _raw = detect_one_face_fast(_wf)
+                if _raw is None:
+                    _warmed += 1  # no face; frame consumed, det exercised
+                    continue
+                _kps = getattr(_raw, "kps", None)
+                if _kps is None or not np.all(np.isfinite(_kps)):
+                    _warmed += 1  # garbage kps from det first-call NaN; skip swap
+                    continue
+                try:
+                    _swapper_obj.get(_wf, _raw, source_image, paste_back=False)
+                    _warmed += 1
+                except Exception as _e:
+                    print(f"[DLC.FACE-SWAPPER] webcam warmup: {_e}")
+                    _warmed += 1
+
         prev_time = time.time()
         fps_update_interval = 0.5
         frame_count = 0
@@ -1050,13 +1169,31 @@ class _ProcessingWorker(QThread):
         det_count = 0
         cached_target_face = None
         cached_many_faces = None
-        det_interval = max(1, round(self._fps * 0.08))
+        det_interval = 1
+        _stable_kps = None
+        _stable_bbox = None
+        # Pure dead zone (sub-pixel): deltas below this are sensor noise, discard.
+        _NOISE_FLOOR = 0.5
+        # Slow-converge zone: 0.5–2.5px residuals after movement are drifted
+        # back gently so the stable position converges to true face position
+        # within ~5 frames without a visible snap.
+        _CONVERGE_CEIL = 2.5
 
         while not self._stop.is_set():
             try:
                 frame = self._cq.get(timeout=0.05)
             except queue.Empty:
                 continue
+
+            # Unless sync mode is on, drain the capture queue and use the
+            # newest available frame.  This bounds display lag to one capture
+            # interval (~33ms at 30fps) regardless of processing speed.
+            if not getattr(modules.globals, 'live_sync', False):
+                try:
+                    while True:
+                        frame = self._cq.get_nowait()
+                except queue.Empty:
+                    pass
 
             temp_frame = frame
             if modules.globals.live_mirror:
@@ -1076,7 +1213,40 @@ class _ProcessingWorker(QThread):
                         cached_target_face = None
                         cached_many_faces = detect_many_faces_fast(temp_frame)
                     else:
-                        cached_target_face = detect_one_face_fast(temp_frame)
+                        raw_face = detect_one_face_with_landmarks(temp_frame)
+                        if raw_face is not None:
+                            if getattr(modules.globals, 'live_sync', False):
+                                # Sync mode: frames are always fresh, face moves
+                                # smoothly across consecutive frames.  Raw detection
+                                # is accurate — stabilization would only introduce
+                                # lag between the swap position (kps) and the mask
+                                # position (landmarks), causing visible misalignment
+                                # during fast movement.
+                                cached_target_face = raw_face
+                            else:
+                                # Async mode: stale frames in the queue can cause
+                                # large apparent position jumps.  Dead zone + slow
+                                # converge smooths those out.
+                                if _stable_kps is None:
+                                    _stable_kps = raw_face.kps.astype(np.float32).copy()
+                                    _stable_bbox = raw_face.bbox.astype(np.float32).copy()
+                                else:
+                                    kps_delta = float(np.linalg.norm(raw_face.kps - _stable_kps))
+                                    if kps_delta >= _CONVERGE_CEIL:
+                                        alpha = float(np.clip(kps_delta / 15.0, 0.5, 0.95))
+                                        _stable_kps = alpha * raw_face.kps + (1.0 - alpha) * _stable_kps
+                                        _stable_bbox = alpha * raw_face.bbox + (1.0 - alpha) * _stable_bbox
+                                    elif kps_delta >= _NOISE_FLOOR:
+                                        _stable_kps += 0.3 * (raw_face.kps - _stable_kps)
+                                        _stable_bbox += 0.3 * (raw_face.bbox - _stable_bbox)
+                                    # else < 0.5 px: sub-pixel noise, hold position
+                                raw_face.kps = _stable_kps
+                                raw_face.bbox = _stable_bbox
+                                cached_target_face = raw_face
+                        else:
+                            cached_target_face = None
+                            _stable_kps = None
+                            _stable_bbox = None
                         cached_many_faces = None
 
                 cached_faces = None
@@ -1162,19 +1332,20 @@ class _ProcessingWorker(QThread):
 
 
 class WebcamPreviewWindow(QWidget):
-    def __init__(self, camera_index: int):
+    def __init__(self, camera_index: int, width: int = PREVIEW_DEFAULT_WIDTH, height: int = PREVIEW_DEFAULT_HEIGHT):
         super().__init__()
         self.setWindowTitle("Live Preview")
-        self.resize(PREVIEW_DEFAULT_WIDTH, PREVIEW_DEFAULT_HEIGHT)
+        self.resize(width, height)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+
         self._image_label = QLabel()
         self._image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._image_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         layout.addWidget(self._image_label, 1)
 
         self._cap = VideoCapturer(camera_index)
-        if not self._cap.start(PREVIEW_DEFAULT_WIDTH, PREVIEW_DEFAULT_HEIGHT, 60):
+        if not self._cap.start(width, height, 60):
             update_status("Failed to start camera")
             QTimer.singleShot(0, self.close)
             return
@@ -1212,7 +1383,16 @@ class WebcamPreviewWindow(QWidget):
             bgr_frame = self._processed_queue.get_nowait()
         except queue.Empty:
             return
-        bgr_frame = fit_image_to_size(bgr_frame, self.width(), self.height())
+        lw = self._image_label.width()
+        lh = self._image_label.height()
+        if lw > 0 and lh > 0:
+            fh, fw = bgr_frame.shape[:2]
+            ratio = max(lw / fw, lh / fh)
+            rw, rh = max(1, int(fw * ratio)), max(1, int(fh * ratio))
+            bgr_frame = gpu_resize(bgr_frame, dsize=(rw, rh))
+            x0 = (rw - lw) // 2
+            y0 = (rh - lh) // 2
+            bgr_frame = bgr_frame[y0:y0 + lh, x0:x0 + lw]
         self._image_label.setPixmap(_bgr_to_qpixmap(bgr_frame))
 
     def closeEvent(self, event) -> None:
@@ -1236,11 +1416,11 @@ class WebcamPreviewWindow(QWidget):
         event.accept()
 
 
-def _open_webcam_preview(camera_index: int) -> None:
+def _open_webcam_preview(camera_index: int, width: int = PREVIEW_DEFAULT_WIDTH, height: int = PREVIEW_DEFAULT_HEIGHT) -> None:
     global _WEBCAM_PREVIEW
     if _WEBCAM_PREVIEW is not None:
         _WEBCAM_PREVIEW.close()
-    _WEBCAM_PREVIEW = WebcamPreviewWindow(camera_index)
+    _WEBCAM_PREVIEW = WebcamPreviewWindow(camera_index, width, height)
     _WEBCAM_PREVIEW.show()
 
 
@@ -1351,10 +1531,12 @@ class MapperDialog(QDialog):
 class LiveMapperDialog(QDialog):
     """Source × Target mapper for live webcam mode."""
 
-    def __init__(self, camera_index: int, mapping: list):
+    def __init__(self, camera_index: int, mapping: list, preview_width: int = PREVIEW_DEFAULT_WIDTH, preview_height: int = PREVIEW_DEFAULT_HEIGHT):
         super().__init__(_MAIN)
         self._camera_index = camera_index
         self._map = mapping
+        self._preview_width = preview_width
+        self._preview_height = preview_height
         self.setWindowTitle(_("Source x Target Mapper"))
         self.resize(POPUP_LIVE_WIDTH, POPUP_LIVE_HEIGHT)
         layout = QVBoxLayout(self)
@@ -1462,7 +1644,7 @@ class LiveMapperDialog(QDialog):
             simplify_maps()
             self.set_status("Mappings successfully submitted!")
             self.accept()
-            _open_webcam_preview(self._camera_index)
+            _open_webcam_preview(self._camera_index, self._preview_width, self._preview_height)
         else:
             self.set_status("At least 1 source with target is required!")
 
@@ -1474,10 +1656,10 @@ def _open_mapper_dialog(start_cb: Callable, mapping: list) -> None:
     _MAPPER.show()
 
 
-def _open_live_mapper_dialog(camera_index: int, mapping: list) -> None:
+def _open_live_mapper_dialog(camera_index: int, mapping: list, preview_width: int = PREVIEW_DEFAULT_WIDTH, preview_height: int = PREVIEW_DEFAULT_HEIGHT) -> None:
     global _LIVE_MAPPER
     close_mapper_window()
-    _LIVE_MAPPER = LiveMapperDialog(camera_index, mapping)
+    _LIVE_MAPPER = LiveMapperDialog(camera_index, mapping, preview_width, preview_height)
     _LIVE_MAPPER.show()
 
 
