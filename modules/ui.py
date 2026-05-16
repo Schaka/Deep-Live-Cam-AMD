@@ -1078,6 +1078,9 @@ class _ProcessingWorker(QThread):
             cv2.setNumThreads(max(1, modules.globals.execution_threads))
 
         frame_processors = get_frame_processors_modules(modules.globals.frame_processors)
+        _swapper_active = any(
+            getattr(fp, 'NAME', '') == "DLC.FACE-SWAPPER" for fp in frame_processors
+        )
 
         # Load swapper first so MIGraphX compiles (or loads .mxr cache) while
         # VRAM is uncontested. Keep reference for warmup inference below.
@@ -1263,14 +1266,18 @@ class _ProcessingWorker(QThread):
                             )
                     elif fp.NAME == "DLC.FACE-ENHANCER-GPEN256":
                         if modules.globals.fp_ui.get("face_enhancer_gpen256", False):
-                            temp_frame = fp.process_frame(
-                                None, temp_frame, detected_faces=cached_faces
-                            )
+                            # Skip standalone path: swapper branch runs GPEN inline
+                            # so geometry (kps/M) matches perfectly and has no EMA lag.
+                            if not _swapper_active:
+                                temp_frame = fp.process_frame(
+                                    None, temp_frame, detected_faces=cached_faces
+                                )
                     elif fp.NAME == "DLC.FACE-ENHANCER-GPEN512":
                         if modules.globals.fp_ui.get("face_enhancer_gpen512", False):
-                            temp_frame = fp.process_frame(
-                                None, temp_frame, detected_faces=cached_faces
-                            )
+                            if not _swapper_active:
+                                temp_frame = fp.process_frame(
+                                    None, temp_frame, detected_faces=cached_faces
+                                )
                     elif fp.NAME == "DLC.FACE-SWAPPER":
                         swapped_bboxes = []
                         if modules.globals.many_faces and cached_many_faces:
@@ -1289,6 +1296,27 @@ class _ProcessingWorker(QThread):
                                 and cached_target_face.bbox is not None
                             ):
                                 swapped_bboxes.append(cached_target_face.bbox.astype(int))
+                        # Inline GPEN: runs immediately after swap using the same
+                        # cached_target_face (no extra EMA) so M_gpen == M_swap
+                        # geometry, eliminating the flicker from M mismatch.
+                        for _efp in frame_processors:
+                            _gpen512_on = (
+                                _efp.NAME == "DLC.FACE-ENHANCER-GPEN512"
+                                and modules.globals.fp_ui.get("face_enhancer_gpen512", False)
+                            )
+                            _gpen256_on = (
+                                _efp.NAME == "DLC.FACE-ENHANCER-GPEN256"
+                                and modules.globals.fp_ui.get("face_enhancer_gpen256", False)
+                            )
+                            if _gpen512_on or _gpen256_on:
+                                if modules.globals.many_faces and cached_many_faces:
+                                    for _gf in cached_many_faces:
+                                        temp_frame = _efp.enhance_face_inline(temp_frame, _gf)
+                                elif cached_target_face is not None:
+                                    temp_frame = _efp.enhance_face_inline(
+                                        temp_frame, cached_target_face
+                                    )
+                                break
                         temp_frame = fp.apply_post_processing(temp_frame, swapped_bboxes)
                     else:
                         temp_frame = fp.process_frame(source_image, temp_frame)

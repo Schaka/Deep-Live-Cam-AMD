@@ -97,6 +97,22 @@ def enhance_face(temp_frame: Frame, face: Face) -> Frame:
         return temp_frame
 
 
+def enhance_face_inline(temp_frame: Frame, face: Face) -> Frame:
+    """Enhance without EMA — called inline from the swap pipeline so both
+    operations use the exact same keypoints and geometry."""
+    try:
+        session = get_enhancer()
+    except Exception as e:
+        print(f"{NAME}: {e}")
+        return temp_frame
+    try:
+        return enhance_face_onnx(temp_frame, face, session, INPUT_SIZE,
+                                  blend_strength=ENHANCE_BLEND)
+    except Exception as e:
+        print(f"{NAME}: Error during inline face enhancement: {e}")
+        return temp_frame
+
+
 def process_frame(source_face: Face | None, temp_frame: Frame, detected_faces=None) -> Frame:
     if detected_faces:
         target_face = detected_faces[0]
