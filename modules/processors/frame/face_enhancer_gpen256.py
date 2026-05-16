@@ -24,10 +24,11 @@ from modules.processors.frame._onnx_enhancer import (
 
 NAME = "DLC.FACE-ENHANCER-GPEN256"
 INPUT_SIZE = 256
-MODEL_URL = "https://github.com/harisreedhar/Face-Upscalers-ONNX/releases/download/GPEN-BFR/GPEN-BFR-256.onnx"
-MODEL_FILE = "GPEN-BFR-256.onnx"
+MODEL_URL = "https://huggingface.co/facefusion/models-3.0.0/resolve/main/gpen_bfr_256.onnx"
+MODEL_FILE = "gpen_bfr_256.onnx"
 
 ENHANCER = None
+ENHANCER_FAILED = False
 THREAD_LOCK = threading.Lock()
 
 abs_dir = os.path.dirname(os.path.abspath(__file__))
@@ -53,19 +54,25 @@ def pre_start() -> bool:
 
 
 def get_enhancer() -> Any:
-    global ENHANCER
+    global ENHANCER, ENHANCER_FAILED
+    if ENHANCER_FAILED:
+        raise RuntimeError(f"{NAME}: Model failed to load (see earlier log).")
     with THREAD_LOCK:
-        if ENHANCER is None:
-            model_path = os.path.join(models_dir, MODEL_FILE)
-            if not os.path.exists(model_path):
-                from modules.utilities import conditional_download
-                conditional_download(models_dir, [MODEL_URL])
-            if not os.path.exists(model_path):
-                raise FileNotFoundError(f"Model file not found: {model_path}")
-            print(f"{NAME}: Loading ONNX model from {model_path}")
-            ENHANCER = create_onnx_session(model_path)
-            warmup_session(ENHANCER)
-            print(f"{NAME}: Model loaded successfully.")
+        if ENHANCER is None and not ENHANCER_FAILED:
+            try:
+                model_path = os.path.join(models_dir, MODEL_FILE)
+                if not os.path.exists(model_path):
+                    from modules.utilities import conditional_download
+                    conditional_download(models_dir, [MODEL_URL])
+                if not os.path.exists(model_path):
+                    raise FileNotFoundError(f"Model file not found: {model_path}")
+                print(f"{NAME}: Loading ONNX model from {model_path}")
+                ENHANCER = create_onnx_session(model_path)
+                warmup_session(ENHANCER)
+                print(f"{NAME}: Model loaded successfully.")
+            except Exception:
+                ENHANCER_FAILED = True
+                raise
     return ENHANCER
 
 

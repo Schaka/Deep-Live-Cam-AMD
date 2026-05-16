@@ -127,6 +127,9 @@ def create_onnx_session(model_path: str) -> onnxruntime.InferenceSession:
     On Apple Silicon, applies CoreML graph optimizations (Pad decomposition,
     Shape/Gather folding, Split decomposition) to reduce CPU↔ANE partition
     boundaries.
+
+    On AMD/MiGraphX, falls back fp16 → fp32 → CPU when the compiler can't
+    handle the model graph (std::bad_alloc in migraphx_parse_onnx_buffer).
     """
     if IS_APPLE_SILICON:
         from modules.onnx_optimize import optimize_for_coreml
@@ -153,9 +156,47 @@ def create_onnx_session(model_path: str) -> onnxruntime.InferenceSession:
         for p in providers
     ]
     session_options = make_session_options(providers)
-    session = onnxruntime.InferenceSession(
-        model_path, sess_options=session_options, providers=providers,
+
+    try:
+        session = onnxruntime.InferenceSession(
+            model_path, sess_options=session_options, providers=providers,
+        )
+        return session
+    except Exception as e:
+        print(f"ONNX enhancer: Primary providers failed: {e}")
+
+    # MiGraphX fp16 failed — retry fp32 (avoids graph-expansion OOM in compiler)
+    _has_migraphx = any(
+        (isinstance(p, tuple) and p[0] == "MIGraphXExecutionProvider")
+        or p == "MIGraphXExecutionProvider"
+        for p in providers
     )
+    if _has_migraphx:
+        _cache_dir = os.path.expanduser("~/.cache/migraphx_models")
+        fp32_providers = [
+            ("MIGraphXExecutionProvider", {
+                "migraphx_fp16_enable": "0",
+                "migraphx_model_cache_dir": _cache_dir,
+            }) if (isinstance(p, tuple) and p[0] == "MIGraphXExecutionProvider")
+            or p == "MIGraphXExecutionProvider"
+            else p
+            for p in providers
+        ]
+        try:
+            session = onnxruntime.InferenceSession(
+                model_path, sess_options=session_options, providers=fp32_providers,
+            )
+            print("ONNX enhancer: Loaded with MiGraphX fp32.")
+            return session
+        except Exception as e:
+            print(f"ONNX enhancer: MiGraphX fp32 also failed: {e}")
+
+    # CPU fallback — model loads, just slower
+    print("ONNX enhancer: All GPU providers failed. Falling back to CPUExecutionProvider.")
+    session = onnxruntime.InferenceSession(
+        model_path, sess_options=session_options, providers=["CPUExecutionProvider"],
+    )
+    print("ONNX enhancer: Loaded with CPUExecutionProvider.")
     return session
 
 

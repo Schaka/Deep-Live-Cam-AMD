@@ -19,9 +19,14 @@ from modules.utilities import (
 )
 
 FACE_ENHANCER = None
+FACE_ENHANCER_FAILED = False
 THREAD_SEMAPHORE = threading.Semaphore()
 THREAD_LOCK = threading.Lock()
 NAME = "DLC.FACE-ENHANCER"
+
+# 512-model URL — smaller graph, better MiGraphX compile chance than gfpgan-1024.onnx
+_GFPGAN_512_URL = "https://huggingface.co/hacksider/deep-live-cam/resolve/main/GFPGANv1.4.onnx"
+_GFPGAN_512_FILE = "GFPGANv1.4.onnx"
 
 abs_dir = os.path.dirname(os.path.abspath(__file__))
 models_dir = os.path.join(
@@ -43,12 +48,18 @@ FFHQ_TEMPLATE_512 = np.array(
 
 
 def pre_check() -> bool:
-    model_path = os.path.join(models_dir, "gfpgan-1024.onnx")
-    if not os.path.exists(model_path):
+    model_1024 = os.path.join(models_dir, "gfpgan-1024.onnx")
+    model_512 = os.path.join(models_dir, _GFPGAN_512_FILE)
+
+    # Download 512 model if absent — preferred for MiGraphX (smaller graph)
+    if not os.path.exists(model_512):
+        update_status(f"Downloading {_GFPGAN_512_FILE}...", NAME)
+        from modules.utilities import conditional_download
+        conditional_download(models_dir, [_GFPGAN_512_URL])
+
+    if not os.path.exists(model_512) and not os.path.exists(model_1024):
         update_status(
-            f"GFPGAN ONNX model not found at {model_path}. "
-            "Convert GFPGANv1.4.pth by running: python convert_gfpgan_to_onnx.py "
-            "(requires: pip install torch gfpgan basicsr facexlib)",
+            f"No GFPGAN model found. Expected {_GFPGAN_512_FILE} or gfpgan-1024.onnx in {models_dir}.",
             NAME,
         )
         return False
@@ -64,40 +75,55 @@ def pre_start() -> bool:
     return True
 
 
+def _try_migraphx(model_path: str, session_options) -> "onnxruntime.InferenceSession | None":
+    """Try MiGraphX fp32 for model_path. Return session on success, None on failure."""
+    _cache_dir = os.path.expanduser("~/.cache/migraphx_models")
+    os.makedirs(_cache_dir, exist_ok=True)
+    try:
+        sess = onnxruntime.InferenceSession(
+            model_path,
+            sess_options=session_options,
+            providers=[
+                ("MIGraphXExecutionProvider", {
+                    "migraphx_fp16_enable": "0",
+                    "migraphx_model_cache_dir": _cache_dir,
+                }),
+                "CPUExecutionProvider",
+            ],
+        )
+        print(f"{NAME}: Loaded {os.path.basename(model_path)} with MiGraphX fp32.")
+        return sess
+    except Exception as e:
+        print(f"{NAME}: MiGraphX fp32 failed for {os.path.basename(model_path)}: {e}")
+        return None
+
+
 def _create_gfpgan_session(model_path: str) -> onnxruntime.InferenceSession:
     """Try providers in priority order for GFPGAN.
 
-    MiGraphX with fp16 enabled causes std::bad_alloc in simplify_reshapes
-    on GFPGAN's StyleGAN2 reshape graph. Try without fp16 first, then
-    ROCMExecutionProvider, raising only if all GPU options are exhausted.
+    gfpgan-1024.onnx (349 MB) causes std::bad_alloc in migraphx_parse_onnx_buffer.
+    Try GFPGANv1.4.onnx (512x512, smaller graph) first with MiGraphX, then
+    the 1024 model, then ROCMExecutionProvider, then CPU.
     """
     from modules.processors.frame._onnx_enhancer import make_session_options
     session_options = make_session_options()
 
     available = onnxruntime.get_available_providers()
 
-    # Attempt 1: MiGraphX without fp16 (fp16 conversion inflates reshape graph)
     if "MIGraphXExecutionProvider" in available:
-        _cache_dir = os.path.expanduser("~/.cache/migraphx_models")
-        os.makedirs(_cache_dir, exist_ok=True)
-        try:
-            sess = onnxruntime.InferenceSession(
-                model_path,
-                sess_options=session_options,
-                providers=[
-                    ("MIGraphXExecutionProvider", {
-                        "migraphx_fp16_enable": "0",
-                        "migraphx_model_cache_dir": _cache_dir,
-                    }),
-                    "CPUExecutionProvider",
-                ],
-            )
-            print(f"{NAME}: Loaded with MiGraphX (fp32).")
-            return sess
-        except Exception as e:
-            print(f"{NAME}: MiGraphX fp32 failed: {e}")
+        # Try 512 model first — smaller graph is less likely to OOM the MiGraphX compiler
+        model_512 = os.path.join(models_dir, _GFPGAN_512_FILE)
+        if os.path.exists(model_512) and os.path.abspath(model_512) != os.path.abspath(model_path):
+            sess = _try_migraphx(model_512, session_options)
+            if sess:
+                return sess
 
-    # Attempt 2: ROCm EP (HIP kernels, no MiGraphX compiler pass)
+        # Try primary (1024) model with MiGraphX
+        sess = _try_migraphx(model_path, session_options)
+        if sess:
+            return sess
+
+    # ROCm EP (HIP kernels, no MiGraphX compiler pass)
     if "ROCMExecutionProvider" in available:
         try:
             sess = onnxruntime.InferenceSession(
@@ -110,7 +136,7 @@ def _create_gfpgan_session(model_path: str) -> onnxruntime.InferenceSession:
         except Exception as e:
             print(f"{NAME}: ROCMExecutionProvider failed: {e}")
 
-    # Attempt 3: any non-MiGraphX GPU provider from globals
+    # Any non-MiGraphX GPU provider from globals
     from modules.processors.frame._onnx_enhancer import build_provider_config
     non_migraphx = [
         p for p in build_provider_config()
@@ -129,59 +155,54 @@ def _create_gfpgan_session(model_path: str) -> onnxruntime.InferenceSession:
         except Exception as e:
             print(f"{NAME}: Fallback providers failed: {e}")
 
-    raise RuntimeError("No GPU provider could load GFPGAN. Check MiGraphX/ROCm setup.")
+    # CPU — better than crashing the processing thread
+    print(f"{NAME}: All GPU providers failed. Falling back to CPUExecutionProvider.")
+    sess = onnxruntime.InferenceSession(
+        model_path,
+        sess_options=session_options,
+        providers=["CPUExecutionProvider"],
+    )
+    print(f"{NAME}: Loaded with CPUExecutionProvider.")
+    return sess
 
 
 def get_face_enhancer() -> onnxruntime.InferenceSession:
-    """
-    Initializes and returns the GFPGAN ONNX Runtime inference session,
-    using the execution providers configured in modules.globals.
-    """
-    global FACE_ENHANCER
+    global FACE_ENHANCER, FACE_ENHANCER_FAILED
+
+    if FACE_ENHANCER_FAILED:
+        raise RuntimeError(f"{NAME}: Model failed to load (see earlier log).")
 
     with THREAD_LOCK:
-        if FACE_ENHANCER is None:
-            model_path = os.path.join(models_dir, "gfpgan-1024.onnx")
-
-            if not os.path.exists(model_path):
+        if FACE_ENHANCER is None and not FACE_ENHANCER_FAILED:
+            # Prefer 512 model as primary — _create_gfpgan_session also tries it
+            # first internally, but passing it here makes the file-not-found check
+            # use the right path when only the 512 model is present.
+            model_512 = os.path.join(models_dir, _GFPGAN_512_FILE)
+            model_1024 = os.path.join(models_dir, "gfpgan-1024.onnx")
+            if os.path.exists(model_512):
+                model_path = model_512
+            elif os.path.exists(model_1024):
+                model_path = model_1024
+            else:
+                FACE_ENHANCER_FAILED = True
                 raise FileNotFoundError(
-                    f"{NAME}: Model not found at {model_path}"
+                    f"{NAME}: No GFPGAN model found. "
+                    f"Expected {_GFPGAN_512_FILE} or gfpgan-1024.onnx in {models_dir}"
                 )
 
             try:
-                try:
-                    FACE_ENHANCER = _create_gfpgan_session(model_path)
-                except Exception as gpu_err:
-                    print(f"{NAME}: All GPU providers failed: {gpu_err}")
-                    raise
-
+                FACE_ENHANCER = _create_gfpgan_session(model_path)
                 input_info = FACE_ENHANCER.get_inputs()[0]
                 output_info = FACE_ENHANCER.get_outputs()[0]
                 active_providers = FACE_ENHANCER.get_providers()
-                print(
-                    f"{NAME}: GFPGAN ONNX model loaded successfully."
-                )
-                print(
-                    f"{NAME}: Input: {input_info.name}, "
-                    f"shape: {input_info.shape}, type: {input_info.type}"
-                )
-                print(
-                    f"{NAME}: Output: {output_info.name}, "
-                    f"shape: {output_info.shape}, type: {output_info.type}"
-                )
+                print(f"{NAME}: GFPGAN ONNX model loaded successfully.")
+                print(f"{NAME}: Input: {input_info.name}, shape: {input_info.shape}")
+                print(f"{NAME}: Output: {output_info.name}, shape: {output_info.shape}")
                 print(f"{NAME}: Active providers: {active_providers}")
-
             except Exception as e:
                 print(f"{NAME}: Error loading GFPGAN ONNX model: {e}")
-                FACE_ENHANCER = None
-                raise RuntimeError(
-                    f"{NAME}: Failed to load GFPGAN ONNX model: {e}"
-                )
-
-    if FACE_ENHANCER is None:
-        raise RuntimeError(
-            f"{NAME}: Failed to initialize GFPGAN ONNX session. Check logs."
-        )
+                FACE_ENHANCER_FAILED = True
+                raise RuntimeError(f"{NAME}: Failed to load GFPGAN ONNX model: {e}")
 
     return FACE_ENHANCER
 
