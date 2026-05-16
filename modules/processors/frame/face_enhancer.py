@@ -207,6 +207,16 @@ def get_face_enhancer() -> onnxruntime.InferenceSession:
     return FACE_ENHANCER
 
 
+def _compute_affine(landmarks_5: np.ndarray, output_size: int) -> "np.ndarray | None":
+    """Compute affine matrix only — no warp. Used for cache-frame paste-back."""
+    scale = output_size / 512.0
+    template = FFHQ_TEMPLATE_512 * scale
+    affine_matrix, _ = cv2.estimateAffinePartial2D(
+        landmarks_5, template, method=cv2.LMEDS
+    )
+    return affine_matrix
+
+
 def _align_face(
     frame: Frame, landmarks_5: np.ndarray, output_size: int
 ) -> tuple:
@@ -459,12 +469,16 @@ def enhance_face(temp_frame: Frame, detected_faces=None) -> Frame:
                 print(f"{NAME}: Error enhancing a face: {e}")
                 continue
         else:
-            # Reuse cached enhanced face — just paste back onto current frame
+            # Reuse cached enhanced face with a fresh affine matrix for this frame.
+            # Using the stale cached matrix causes jitter when the face moves between
+            # inference frames — recomputing the matrix is cheap (no warp needed).
             cached = _enh_live_cache
             if cached['enhanced_bgr'] is not None:
+                fresh_matrix = _compute_affine(landmarks_5, cached['align_size'])
+                paste_matrix = fresh_matrix if fresh_matrix is not None else cached['affine_matrix']
                 _paste_back(
                     temp_frame, cached['enhanced_bgr'],
-                    cached['affine_matrix'],
+                    paste_matrix,
                     output_size=cached['align_size'],
                 )
         if not many_faces_mode:

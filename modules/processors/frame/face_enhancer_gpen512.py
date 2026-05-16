@@ -16,7 +16,9 @@ from modules.utilities import (
     is_image,
     is_video,
 )
+from insightface.app.common import Face as _InsightFace
 from modules.processors.frame._onnx_enhancer import (
+    KpsEma,
     create_onnx_session,
     warmup_session,
     enhance_face_onnx,
@@ -26,10 +28,12 @@ NAME = "DLC.FACE-ENHANCER-GPEN512"
 INPUT_SIZE = 512
 MODEL_URL = "https://huggingface.co/facefusion/models-3.0.0/resolve/main/gpen_bfr_512.onnx"
 MODEL_FILE = "gpen_bfr_512.onnx"
+ENHANCE_BLEND = 0.80  # 1.0 = full GPEN output; lower preserves original texture
 
 ENHANCER = None
 ENHANCER_FAILED = False
 THREAD_LOCK = threading.Lock()
+_kps_ema = KpsEma()
 
 abs_dir = os.path.dirname(os.path.abspath(__file__))
 models_dir = os.path.join(
@@ -83,7 +87,11 @@ def enhance_face(temp_frame: Frame, face: Face) -> Frame:
         print(f"{NAME}: {e}")
         return temp_frame
     try:
-        return enhance_face_onnx(temp_frame, face, session, INPUT_SIZE)
+        if face.kps is not None:
+            smoothed = _kps_ema.smooth(face.kps.astype(np.float32))
+            face = _InsightFace({**face, 'kps': smoothed})
+        return enhance_face_onnx(temp_frame, face, session, INPUT_SIZE,
+                                  blend_strength=ENHANCE_BLEND)
     except Exception as e:
         print(f"{NAME}: Error during face enhancement: {e}")
         return temp_frame

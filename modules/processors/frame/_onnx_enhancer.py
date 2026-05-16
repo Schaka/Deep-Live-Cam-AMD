@@ -7,6 +7,7 @@ enhance-face-via-ONNX pipeline.
 import os
 import platform
 import threading
+import time
 from typing import Any
 
 import cv2
@@ -14,11 +15,58 @@ import numpy as np
 import onnxruntime
 
 import modules.globals
+from modules.face_mask import build_face_hull_mask
 
 IS_APPLE_SILICON = platform.system() == "Darwin" and platform.machine() == "arm64"
 
 # Limit concurrent ONNX calls to avoid VRAM exhaustion on multi-face frames
 THREAD_SEMAPHORE = threading.Semaphore(min(max(1, (os.cpu_count() or 1)), 8))
+
+
+class KpsEma:
+    """Adaptive-alpha EMA smoother for 5-point face keypoints.
+
+    At rest (dist ≈ 0): uses alpha_min — heavy smoothing, no idle jitter.
+    When moving fast (dist → jump_threshold/2): ramps to alpha_max — responsive,
+    no lag. Resets entirely on jumps larger than jump_threshold.
+    """
+
+    def __init__(
+        self,
+        alpha: float = 0.35,
+        alpha_max: float = 0.92,
+        jump_threshold: float = 25.0,
+    ) -> None:
+        self._alpha_min = alpha
+        self._alpha_max = alpha_max
+        self._jump = jump_threshold
+        self._prev: "np.ndarray | None" = None
+        self._last_t: float = 0.0
+
+    def smooth(self, kps: np.ndarray) -> np.ndarray:
+        kps = kps.astype(np.float32)
+        now = time.perf_counter()
+        if self._prev is not None:
+            dist = float(np.linalg.norm(kps - self._prev))
+            if dist > self._jump:
+                self._prev = kps.copy()
+            else:
+                # Scale alpha_max by how much time has passed relative to 30 fps.
+                # Sub-30 fps → longer interval → legitimate fast motion displaces
+                # more pixels per frame, so be proportionally more responsive.
+                dt = now - self._last_t
+                time_scale = min(dt / (1.0 / 30.0), 1.5) if self._last_t else 1.0
+                alpha_max_t = min(self._alpha_max * time_scale, 1.0)
+                t = min(dist / (self._jump * 0.30), 1.0)
+                alpha = self._alpha_min + t * (alpha_max_t - self._alpha_min)
+                kps = alpha * kps + (1.0 - alpha) * self._prev
+        self._prev = kps.copy()
+        self._last_t = now
+        return kps
+
+    def reset(self) -> None:
+        self._prev = None
+        self._last_t = 0.0
 
 
 def _is_gpu_provider_active(providers=None) -> bool:
@@ -277,8 +325,15 @@ def enhance_face_onnx(
     face: Any,
     session: onnxruntime.InferenceSession,
     input_size: int,
+    blend_strength: float = 1.0,
 ) -> np.ndarray:
-    """Enhance a single face in the frame using an ONNX face restoration model."""
+    """Enhance a single face in the frame using an ONNX face restoration model.
+
+    blend_strength: 1.0 = full enhanced output, <1.0 blends back original
+    texture to reduce over-smoothing from aggressive face restoration models.
+    Uses landmark_2d_106 convex-hull mask when available to avoid the visible
+    rectangular boundary that the warped rectangular mask produces.
+    """
     M, inv_M = _get_face_affine(face, input_size)
     if M is None:
         return frame
@@ -294,25 +349,34 @@ def enhance_face_onnx(
         output = run_inference(session, input_name, blob)
     enhanced = postprocess_face(output)
 
-    # Create mask for blending (feathered edges)
-    mask = np.ones((input_size, input_size), dtype=np.float32)
+    # Rectangular feathered mask in aligned space — prevents warp-edge seam artifacts
+    rect_mask = np.ones((input_size, input_size), dtype=np.float32)
     border = max(1, input_size // 16)
-    mask[:border, :] = np.linspace(0, 1, border)[:, np.newaxis]
-    mask[-border:, :] = np.linspace(1, 0, border)[:, np.newaxis]
-    mask[:, :border] = np.minimum(mask[:, :border], np.linspace(0, 1, border)[np.newaxis, :])
-    mask[:, -border:] = np.minimum(mask[:, -border:], np.linspace(1, 0, border)[np.newaxis, :])
+    rect_mask[:border, :] = np.linspace(0, 1, border)[:, np.newaxis]
+    rect_mask[-border:, :] = np.linspace(1, 0, border)[:, np.newaxis]
+    rect_mask[:, :border] = np.minimum(rect_mask[:, :border], np.linspace(0, 1, border)[np.newaxis, :])
+    rect_mask[:, -border:] = np.minimum(rect_mask[:, -border:], np.linspace(1, 0, border)[np.newaxis, :])
 
     h, w = frame.shape[:2]
     warped_enhanced = cv2.warpAffine(
         enhanced, inv_M, (w, h),
         flags=cv2.INTER_LINEAR, borderValue=(0, 0, 0),
     )
-    warped_mask = cv2.warpAffine(
-        mask, inv_M, (w, h),
+    warped_rect = cv2.warpAffine(
+        rect_mask, inv_M, (w, h),
         flags=cv2.INTER_LINEAR, borderValue=0,
     )
 
-    mask_3ch = warped_mask[:, :, np.newaxis]
+    # Intersect rectangular warp mask with face-contour hull mask.
+    # Hull mask clips blend to face shape (no visible box against backgrounds).
+    # Rectangular mask clips to the warped GPEN output region (no seam at warp edge).
+    hull_mask = build_face_hull_mask(face, frame.shape)
+    if hull_mask is not None:
+        blend_mask = np.minimum(warped_rect, hull_mask)
+    else:
+        blend_mask = warped_rect
+
+    mask_3ch = blend_mask[:, :, np.newaxis] * blend_strength
     result = (warped_enhanced.astype(np.float32) * mask_3ch +
               frame.astype(np.float32) * (1.0 - mask_3ch))
     return np.clip(result, 0, 255).astype(np.uint8)
