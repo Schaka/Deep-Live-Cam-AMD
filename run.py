@@ -52,6 +52,41 @@ if sys.platform == "win32":
             except (OSError, AttributeError):
                 pass
 
+# On Linux, pre-load NVIDIA shared libraries (cuDNN, cuBLAS, nvrtc...) shipped
+# inside the venv via pip wheels (nvidia-cudnn-cu12, etc.). LD_LIBRARY_PATH
+# cannot be set after Python starts, so we use ctypes.CDLL with RTLD_GLOBAL
+# instead. This makes symbols available to onnxruntime when it dlopens its
+# CUDA provider.
+if sys.platform.startswith("linux"):
+    import ctypes
+    import glob
+    _py_lib = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    _site_packages_candidates = [
+        os.path.join(project_root, "venv", "lib", _py_lib, "site-packages"),
+        os.path.join(sys.prefix, "lib", _py_lib, "site-packages"),
+    ]
+    for _sp in _site_packages_candidates:
+        _nvidia_dir = os.path.join(_sp, "nvidia")
+        if not os.path.isdir(_nvidia_dir):
+            continue
+        for _pkg in os.listdir(_nvidia_dir):
+            _lib_dir = os.path.join(_nvidia_dir, _pkg, "lib")
+            if not os.path.isdir(_lib_dir):
+                continue
+            # Also expose the directory to child processes, without
+            # duplicating an entry that is already present.
+            _ldp = os.environ.get("LD_LIBRARY_PATH", "")
+            if _lib_dir not in _ldp.split(os.pathsep):
+                os.environ["LD_LIBRARY_PATH"] = (
+                    _lib_dir + (os.pathsep + _ldp if _ldp else "")
+                )
+            for _so in sorted(glob.glob(os.path.join(_lib_dir, "lib*.so*"))):
+                try:
+                    ctypes.CDLL(_so, mode=ctypes.RTLD_GLOBAL)
+                except OSError:
+                    pass
+        break
+
 from modules import platform_info
 platform_info.print_banner()
 
