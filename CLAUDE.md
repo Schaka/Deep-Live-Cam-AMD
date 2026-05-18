@@ -47,8 +47,8 @@ All inference must run on the GPU. The CPU should be nearly idle during normal o
 | `modules/processors/frame/face_swapper.py` | Face swap, mask blending, MiGraphX provider config |
 | `modules/processors/frame/face_analyser.py` | Face detection with landmark_2d_106 |
 | `modules/processors/frame/_onnx_enhancer.py` | GPEN/GFPGAN enhancer, shared SessionOptions helper |
-| `modules/ui.py` | PyQt UI, _ProcessingWorker, _CaptureWorker, sync mode |
-| `modules/globals.py` | Global state including `live_sync` flag |
+| `modules/ui.py` | PyQt UI, _ProcessingWorker, _CaptureWorker |
+| `modules/globals.py` | Global state |
 | `jitter_handling.md` | Detailed write-up of jitter root causes and fixes |
 | `run-on-linux.md` | AMD Linux setup instructions |
 
@@ -62,12 +62,6 @@ All inference must run on the GPU. The CPU should be nearly idle during normal o
 | `_fast_paste_back` | `face_swapper.py` | Fallback: feathered rectangular affine mask |
 | `make_session_options` | `_onnx_enhancer.py` | Shared ORT SessionOptions with thread limits |
 | `get_face_swapper` | `face_swapper.py` | Loads inswapper with MiGraphX FP16 config |
-
-## Globals That Matter
-
-| Global | Default | Effect |
-|---|---|---|
-| `live_sync` | `False` | True = process every frame in order, no queue drain, no stabilizer |
 
 ## MiGraphX Provider Config
 

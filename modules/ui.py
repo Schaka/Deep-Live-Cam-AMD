@@ -59,6 +59,7 @@ from modules.face_analyser import (
     detect_many_faces_fast,
     detect_one_face_fast,
     detect_one_face_with_landmarks,
+    ensure_landmarks,
     get_one_face,
     get_unique_faces_from_target_image,
     get_unique_faces_from_target_video,
@@ -315,7 +316,6 @@ def save_switch_states():
         "nsfw_filter": modules.globals.nsfw_filter,
         "live_mirror": modules.globals.live_mirror,
         "live_resizable": modules.globals.live_resizable,
-        "live_sync": modules.globals.live_sync,
         "fp_ui": modules.globals.fp_ui,
         "show_fps": modules.globals.show_fps,
         "mouth_mask": modules.globals.mouth_mask,
@@ -343,11 +343,12 @@ def load_switch_states():
         modules.globals.nsfw_filter = state.get("nsfw_filter", False)
         modules.globals.live_mirror = state.get("live_mirror", False)
         modules.globals.live_resizable = state.get("live_resizable", False)
-        modules.globals.live_sync = state.get("live_sync", True)
         modules.globals.fp_ui = state.get("fp_ui", {"face_enhancer": False})
         modules.globals.show_fps = state.get("show_fps", False)
-        modules.globals.mouth_mask_size = state.get("mouth_mask_size", 0.0)
-        modules.globals.mouth_mask = modules.globals.mouth_mask_size > 0
+        # Mouth mask always starts disabled (slider at 0) on launch,
+        # regardless of the persisted value — enable it explicitly each session.
+        modules.globals.mouth_mask_size = 0.0
+        modules.globals.mouth_mask = False
         modules.globals.show_mouth_mask_box = False
     except FileNotFoundError:
         pass
@@ -665,9 +666,9 @@ class MainWindow(QMainWindow):
         self.s_sharpness.setToolTip(_("Sharpen the enhanced face output"))
         grid.addWidget(self.s_sharpness, 1, 1)
 
-        # Mouth mask
+        # Mouth mask — always starts at 0 (disabled) on launch
         grid.addWidget(QLabel(_("Mouth Mask")), 2, 0)
-        self.s_mouth = slider(0.0, 100.0, modules.globals.mouth_mask_size, 1,
+        self.s_mouth = slider(0.0, 100.0, 0.0, 1,
                               self._on_mouth_mask_change)
         self.s_mouth.sliderPressed.connect(self._on_mouth_mask_pressed)
         self.s_mouth.sliderReleased.connect(self._on_mouth_mask_released)
@@ -725,19 +726,6 @@ class MainWindow(QMainWindow):
             self.cb_preview_size.addItem(label, (w, h))
         self.cb_preview_size.setToolTip(_("Preview window size"))
         layout.addWidget(self.cb_preview_size)
-
-        self.sw_live_sync = _Switch(
-            _("Sync mode"),
-            modules.globals.live_sync,
-            _("Process every frame in order (less jitter on fast movement, may lower FPS)"),
-        )
-        self.sw_live_sync.toggled.connect(
-            lambda v: (
-                setattr(modules.globals, "live_sync", v),
-                save_switch_states(),
-            )
-        )
-        layout.addWidget(self.sw_live_sync)
 
         self.btn_live = QPushButton(_("Live"))
         self.btn_live.setEnabled(cam_ok)
@@ -1188,15 +1176,14 @@ class _ProcessingWorker(QThread):
             except queue.Empty:
                 continue
 
-            # Unless sync mode is on, drain the capture queue and use the
-            # newest available frame.  This bounds display lag to one capture
-            # interval (~33ms at 30fps) regardless of processing speed.
-            if not getattr(modules.globals, 'live_sync', False):
-                try:
-                    while True:
-                        frame = self._cq.get_nowait()
-                except queue.Empty:
-                    pass
+            # Drain the capture queue and use the newest available frame.
+            # This bounds display lag to one capture interval (~33ms at 30fps)
+            # regardless of processing speed.
+            try:
+                while True:
+                    frame = self._cq.get_nowait()
+            except queue.Empty:
+                pass
 
             temp_frame = frame
             if modules.globals.live_mirror:
@@ -1218,34 +1205,26 @@ class _ProcessingWorker(QThread):
                     else:
                         raw_face = detect_one_face_with_landmarks(temp_frame)
                         if raw_face is not None:
-                            if getattr(modules.globals, 'live_sync', False):
-                                # Sync mode: frames are always fresh, face moves
-                                # smoothly across consecutive frames.  Raw detection
-                                # is accurate — stabilization would only introduce
-                                # lag between the swap position (kps) and the mask
-                                # position (landmarks), causing visible misalignment
-                                # during fast movement.
-                                cached_target_face = raw_face
+                            # Dead zone + slow-converge: stale frames from the
+                            # drained queue can cause large apparent position jumps.
+                            # Sub-pixel noise is discarded; real movement is tracked
+                            # with a soft converge to avoid snapping.
+                            if _stable_kps is None:
+                                _stable_kps = raw_face.kps.astype(np.float32).copy()
+                                _stable_bbox = raw_face.bbox.astype(np.float32).copy()
                             else:
-                                # Async mode: stale frames in the queue can cause
-                                # large apparent position jumps.  Dead zone + slow
-                                # converge smooths those out.
-                                if _stable_kps is None:
-                                    _stable_kps = raw_face.kps.astype(np.float32).copy()
-                                    _stable_bbox = raw_face.bbox.astype(np.float32).copy()
-                                else:
-                                    kps_delta = float(np.linalg.norm(raw_face.kps - _stable_kps))
-                                    if kps_delta >= _CONVERGE_CEIL:
-                                        alpha = float(np.clip(kps_delta / 15.0, 0.5, 0.95))
-                                        _stable_kps = alpha * raw_face.kps + (1.0 - alpha) * _stable_kps
-                                        _stable_bbox = alpha * raw_face.bbox + (1.0 - alpha) * _stable_bbox
-                                    elif kps_delta >= _NOISE_FLOOR:
-                                        _stable_kps += 0.3 * (raw_face.kps - _stable_kps)
-                                        _stable_bbox += 0.3 * (raw_face.bbox - _stable_bbox)
-                                    # else < 0.5 px: sub-pixel noise, hold position
-                                raw_face.kps = _stable_kps
-                                raw_face.bbox = _stable_bbox
-                                cached_target_face = raw_face
+                                kps_delta = float(np.linalg.norm(raw_face.kps - _stable_kps))
+                                if kps_delta >= _CONVERGE_CEIL:
+                                    alpha = float(np.clip(kps_delta / 15.0, 0.5, 0.95))
+                                    _stable_kps = alpha * raw_face.kps + (1.0 - alpha) * _stable_kps
+                                    _stable_bbox = alpha * raw_face.bbox + (1.0 - alpha) * _stable_bbox
+                                elif kps_delta >= _NOISE_FLOOR:
+                                    _stable_kps += 0.3 * (raw_face.kps - _stable_kps)
+                                    _stable_bbox += 0.3 * (raw_face.bbox - _stable_bbox)
+                                # else < 0.5 px: sub-pixel noise, hold position
+                            raw_face.kps = _stable_kps
+                            raw_face.bbox = _stable_bbox
+                            cached_target_face = raw_face
                         else:
                             cached_target_face = None
                             _stable_kps = None
@@ -1257,6 +1236,12 @@ class _ProcessingWorker(QThread):
                     cached_faces = cached_many_faces
                 elif cached_target_face is not None:
                     cached_faces = [cached_target_face]
+
+                # Fast detection skips the 2d106 landmark model, but the mouth
+                # mask needs it. Attach landmarks on demand (computed once per
+                # detection cycle — the helper no-ops if already present).
+                if modules.globals.mouth_mask and cached_faces:
+                    ensure_landmarks(temp_frame, cached_faces)
 
                 for fp in frame_processors:
                     if fp.NAME == "DLC.FACE-ENHANCER":
