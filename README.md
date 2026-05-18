@@ -60,9 +60,7 @@ if _is_migraphx:
 
 That alone will get MiGraphX running with the upstream code. You will still see a rectangular boundary around the swapped face on high-contrast backgrounds (the original square paste-back behavior), but it is not always obvious depending on the scene.
 
-The additional changes in this fork (landmark-based face mask blending, sync mode, ORT session thread limits, etc.) were built on top of that foundation to address specific artifacts. Many of them may not be necessary if your GPU is fast enough to process frames at or above webcam framerate without the CPU being hammered by HIP busy-polling. The interrupt mode fix alone removes most of the timing jitter. Everything else is incremental improvement.
-
-Sync mode in particular was an attempt to address a mismatch between the rate at which the model produces swapped frames and the rate at which the webcam delivers new ones. On a GPU that keeps up with the webcam, the queue draining approach (async default) is sufficient and sync mode offers little benefit.
+The additional changes in this fork (landmark-based face mask blending, ORT session thread limits, etc.) were built on top of that foundation to address specific artifacts. Many of them may not be necessary if your GPU is fast enough to process frames at or above webcam framerate without the CPU being hammered by HIP busy-polling. The interrupt mode fix alone removes most of the timing jitter. Everything else is incremental improvement.
 
 ---
 
@@ -76,15 +74,16 @@ This fork replaces that approach with a convex-hull mask derived from the `landm
 
 The old rectangular paste-back is kept as a fallback for cases where landmarks are unavailable.
 
-### Sync Mode and Jitter Fixes
+### Jitter Fixes
 
-In async (default) mode, the capture queue can accumulate frames faster than the GPU processes them. The processing worker would consume a frame that was already 1-2 frames stale by display time. The face-shaped mask was drawn from accurate current landmarks, but the swap was placed using stale keypoints, causing visible misalignment during movement.
+The capture queue can accumulate frames faster than the GPU processes them. The processing worker would consume a frame already 1–2 frames stale by display time. The face-shaped mask was drawn from accurate current landmarks but the swap was placed using stale keypoints, causing visible misalignment during movement.
 
 Fixes applied:
 
-- **Queue draining in async mode:** after pulling a frame from the capture queue, any remaining queued frames are discarded and only the newest is processed. This bounds display lag to approximately one capture interval (~33ms at 30fps).
-- **Sync mode toggle:** a new "Sync mode" option in the UI disables queue draining and processes every frame in order. In sync mode, frames are always fresh and consecutive, so the face moves smoothly without needing stabilization. The stabilizer (dead-zone + convergence blend) is disabled in sync mode because it would cause the swap keypoints to lag behind the accurate landmark positions, creating the very misalignment it was meant to prevent.
-- **Stabilizer retained for async mode:** in async mode, the dead-zone stabilizer still runs to smooth out the jumps caused by stale frames.
+- **Queue draining:** after pulling a frame from the capture queue, any remaining queued frames are discarded and only the newest is processed. This bounds display lag to approximately one capture interval (~33ms at 30fps).
+- **Dead-zone + slow-converge stabilizer:** sub-pixel ONNX detector noise (<0.5px) is discarded. Real movement is tracked with a soft converge to avoid snapping. Swapper, face enhancer, and hull mask all consume the same stabilized face object so there is no geometry mismatch between them.
+- **Elliptical paste mask:** the paste-back alpha template is elliptical rather than square, zeroing the corners of the inswapper crop and eliminating the visible box artifact on high-contrast backgrounds.
+- **Poisson blend improvement:** the seamlessClone mask is derived from the swap's own affine transform (M) rather than independently detected landmarks, so it tracks the swapped face exactly per-frame with no jitter source.
 
 ### CPU Load Reduction (ROCm / HIP Interrupt Mode)
 
@@ -240,7 +239,6 @@ On first run, MiGraphX will compile the models and cache them in `~/.cache/migra
 
 | Option | Description |
 |---|---|
-| Sync mode | Process every frame in order. Reduces jitter during fast movement at the cost of potential FPS reduction if the GPU cannot keep up with the webcam framerate. |
 | Show FPS | Display swap rate counter on the live preview. |
 
 ---
@@ -284,7 +282,7 @@ options:
 
 ## Known Limitations
 
-- **Face enhancer:** the GFPGAN and GPEN enhancer options exist in the UI but are not well tested with MiGraphX. The original codebase provides no documentation on how these models are expected to behave under non-CUDA providers. They may produce incorrect results or fail silently. Disable them if the output looks wrong.
+- **Face enhancer:** GFPGAN and GPEN (256/512) enhancers are supported and tested with MiGraphX. GPEN runs inline immediately after the swap using the same keypoints, so geometry stays aligned. Disable if the output looks wrong or if GPU memory is tight.
 - **Many faces / Map faces:** these modes are inherited from upstream and have not been specifically tested with the MiGraphX code paths in this fork.
 - This fork targets live webcam mode first. Image/video batch processing should work but is secondary.
 
